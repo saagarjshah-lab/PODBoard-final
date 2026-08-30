@@ -2,7 +2,6 @@ services:
   - type: web
     name: pod-weekly-tracker
     runtime: static
-    plan: free
     branch: main
     buildCommand: npm ci && npm run build
     staticPublishPath: ./dist
