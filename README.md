@@ -16,6 +16,31 @@ branding (logo/name/tagline).
 
 ---
 
+## What's new in this update
+- **Password login**: the auth screen now uses email + password (`signUp` /
+  `signInWithPassword`) instead of magic links. Toggle between "Sign in" and
+  "Create account" on the same screen.
+- **Routing by role**: after login the URL hash is set to `#/admin` or
+  `#/member` based on the signed-in user's role in `profiles`. A member
+  can't force their way into `#/admin` by editing the hash.
+- **Projects & staffing**: a new **Projects** tab (admin-only) lets admins
+  create projects, set their status (ongoing/on hold/completed), and toggle
+  which team members are staffed on each — stored in the new `projects` /
+  `project_assignments` tables. A new **My Projects** tab shows each signed-in
+  member only the projects they're staffed on, with a shortcut to log hours.
+- **Ongoing-projects filter**: an admin-only dropdown in the toolbar filters
+  the Week Board and Rollup pipeline/delivered lists down to a single
+  ongoing project.
+- Run `supabase/schema_update.sql` **after** the existing `001`–`005` scripts
+  to add the new tables/columns/policies. It's idempotent — safe to re-run.
+- A member's login is linked to their `members` row automatically the first
+  time they sign in, provided an admin has already set that member's `email`
+  column to match (edit it directly in the Supabase table editor, or extend
+  the Team tab form — not included by default to keep the diff minimal).
+- In **Authentication → Providers → Email**, decide whether "Confirm email"
+  is on. If it's on, `signUp` won't return a session immediately — the user
+  sees "check your email to confirm" and then signs in normally afterward.
+
 ## 1. Supabase setup
 
 1. Create a project at https://supabase.com.

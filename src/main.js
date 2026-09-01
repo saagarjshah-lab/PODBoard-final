@@ -1,8 +1,10 @@
 import * as XLSX from 'xlsx';
-import { initAuth, isAdmin } from './lib/auth.js';
+import { initAuth, isAdmin, getSession } from './lib/auth.js';
 import {
   fetchBoard, updateAppSettings, insertMember, updateMemberCapacity, deleteMember,
   upsertAssignment, deleteAssignment, subscribeToBoard,
+  fetchProjects, insertProject, updateProjectStatus, deleteProjectRow,
+  assignMemberToProject, unassignMemberFromProject, getMemberIdForAuthUser,
 } from './lib/db.js';
 
 /* ================= State ================= */
@@ -11,6 +13,9 @@ let weeks = [];
 let selectedWeek = null;
 let editCtx = null; // {memberId, projectId|null}
 let unsubscribeRealtime = null;
+let projects = []; // [{id,name,description,status,memberIds}]
+let projectFilter = ''; // '' = all projects; else a project name (admin ongoing-projects dropdown)
+let myMemberId = null; // members.id linked to the current auth user, if any
 
 const PRIORITIES = ["Urgent", "According to SLA's", "Not started"];
 const STATUSES = ['Not started', 'In progress', 'In review', 'Done', 'Blocked'];
@@ -88,6 +93,11 @@ function currentWeekLabel() {
 async function loadData() {
   data = await fetchBoard();
   Object.keys(data.assignments).forEach((w) => { if (!weeks.includes(w)) weeks.push(w); });
+  try { projects = await fetchProjects(); } catch (e) { projects = []; }
+  try {
+    const session = getSession();
+    myMemberId = session ? await getMemberIdForAuthUser(session.user.id) : null;
+  } catch (e) { myMemberId = null; }
 }
 async function reload() { await loadData(); render(); }
 
@@ -129,8 +139,13 @@ function utilFlag(pct) {
 /* ================= Tabs / controls ================= */
 window.switchTab = function switchTab(tab) {
   document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === tab));
-  ['board', 'overview', 'rollup', 'team'].forEach((t) => { document.getElementById('tab-' + t).style.display = t === tab ? 'block' : 'none'; });
+  ['board', 'overview', 'rollup', 'team', 'projects', 'myprojects'].forEach((t) => {
+    const el = document.getElementById('tab-' + t);
+    if (el) el.style.display = t === tab ? 'block' : 'none';
+  });
   if (tab === 'rollup') renderRollup();
+  if (tab === 'projects') renderProjectsAdmin();
+  if (tab === 'myprojects') renderMyProjects();
 };
 window.setScope = function setScope(scope) {
   rollupScope = scope;
@@ -183,8 +198,130 @@ window.removeMember = async function removeMember(id) {
   } catch (e) { showToast('Only admins can remove members'); }
 };
 
-/* ================= Projects ================= */
-window.openModal = function openModal(memberId, projectId) {
+/* ================= Project entities: admin CRUD + assignment + filter ================= */
+/* Note: these are distinct from the per-week "project" text field logged in
+   the modal below. A `projects` row is a durable entity an admin creates
+   once and staffs members onto; the modal still logs actual hours per week
+   against a project *name* (kept as free text for backward compatibility
+   with the existing board/rollup/import-export logic). */
+
+window.onProjectFilterChange = function onProjectFilterChange() {
+  projectFilter = document.getElementById('projectFilterSelect').value || '';
+  render();
+  if (document.getElementById('tab-rollup').style.display !== 'none') renderRollup();
+};
+
+function populateProjectFilterOptions() {
+  const sel = document.getElementById('projectFilterSelect');
+  if (!sel) return;
+  const prev = sel.value;
+  const ongoing = projects.filter((p) => p.status === 'ongoing');
+  sel.innerHTML = '<option value="">All projects</option>' + ongoing.map((p) => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join('');
+  if ([...sel.options].some((o) => o.value === prev)) sel.value = prev; else { sel.value = ''; projectFilter = ''; }
+}
+
+window.addProject = async function addProject() {
+  const nameEl = document.getElementById('newProjectName');
+  const statusEl = document.getElementById('newProjectStatus');
+  const name = nameEl.value.trim();
+  if (!name) { showToast('Enter a project name'); return; }
+  try {
+    const p = await insertProject({ name, status: statusEl.value });
+    projects.push(p);
+    nameEl.value = ''; statusEl.value = 'ongoing';
+    renderProjectsAdmin(); populateProjectFilterOptions();
+    showToast('Project added');
+  } catch (e) { showToast('Only admins can add projects'); }
+};
+
+window.setProjectStatus = async function setProjectStatus(id, status) {
+  const p = projects.find((x) => x.id === id); if (!p) return;
+  try { await updateProjectStatus(id, status); p.status = status; renderProjectsAdmin(); populateProjectFilterOptions(); }
+  catch (e) { showToast('Only admins can change project status'); renderProjectsAdmin(); }
+};
+
+window.deleteProjectAdmin = async function deleteProjectAdmin(id) {
+  if (!confirm('Delete this project and its member assignments?')) return;
+  try {
+    await deleteProjectRow(id);
+    projects = projects.filter((p) => p.id !== id);
+    renderProjectsAdmin(); populateProjectFilterOptions();
+    showToast('Project deleted');
+  } catch (e) { showToast('Only admins can delete projects'); }
+};
+
+window.toggleProjectMember = async function toggleProjectMember(projectId, memberId) {
+  const p = projects.find((x) => x.id === projectId); if (!p) return;
+  const assigned = p.memberIds.includes(memberId);
+  try {
+    if (assigned) { await unassignMemberFromProject(projectId, memberId); p.memberIds = p.memberIds.filter((id) => id !== memberId); }
+    else { await assignMemberToProject(projectId, memberId); p.memberIds.push(memberId); }
+    renderProjectsAdmin();
+  } catch (e) { showToast('Only admins can change project staffing'); }
+};
+
+function renderProjectsAdmin() {
+  const el = document.getElementById('projectAdminList');
+  const countEl = document.getElementById('projectCount');
+  if (!el || !countEl) return;
+  countEl.textContent = projects.length;
+  el.innerHTML = projects.length ? projects.map((p) => `
+    <div class="project-admin-card">
+      <div class="project-admin-top">
+        <div>
+          <div class="project-admin-name">${esc(p.name)}</div>
+          <div class="project-admin-desc">${p.memberIds.length} member${p.memberIds.length === 1 ? '' : 's'} assigned</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px;">
+          <select class="mini-select" onchange="setProjectStatus('${p.id}', this.value)">
+            <option value="ongoing" ${p.status === 'ongoing' ? 'selected' : ''}>Ongoing</option>
+            <option value="on_hold" ${p.status === 'on_hold' ? 'selected' : ''}>On hold</option>
+            <option value="completed" ${p.status === 'completed' ? 'selected' : ''}>Completed</option>
+          </select>
+          <span class="project-del-sm" onclick="deleteProjectAdmin('${p.id}')">✕ Delete</span>
+        </div>
+      </div>
+      <div class="chip-list">
+        ${data.members.length ? data.members.map((m) => `
+          <span class="chip ${p.memberIds.includes(m.id) ? 'active' : ''}" onclick="toggleProjectMember('${p.id}', '${m.id}')">${p.memberIds.includes(m.id) ? '✓ ' : ''}${esc(m.name)}</span>
+        `).join('') : '<span class="project-admin-desc">Add team members in the Team tab first.</span>'}
+      </div>
+    </div>`).join('') : '<div class="empty">No projects yet — add one below.</div>';
+}
+
+async function renderMyProjects() {
+  const el = document.getElementById('myProjectsList');
+  if (!el) return;
+  const session = getSession();
+  if (session) { try { myMemberId = await getMemberIdForAuthUser(session.user.id); } catch (e) { /* keep previous value */ } }
+  if (!myMemberId) {
+    el.innerHTML = '<div class="empty">Your login isn\'t linked to a team member yet. Ask your admin to add you in the Team tab using this same email address.</div>';
+    return;
+  }
+  const mine = projects.filter((p) => p.memberIds.includes(myMemberId));
+  if (!mine.length) { el.innerHTML = '<div class="empty">No projects assigned to you yet.</div>'; return; }
+  el.innerHTML = mine.map((p) => {
+    const hrsThisWeek = getProjects(selectedWeek, myMemberId).filter((a) => (a.project || '').trim().toLowerCase() === p.name.trim().toLowerCase()).reduce((s, a) => s + projectHours(a), 0);
+    return `
+    <div class="proj-item">
+      <div>
+        <div class="pname">${esc(p.name)}</div>
+        <div class="pmeta">Status: ${esc(p.status.replace('_', ' '))} · ${hrsThisWeek}h logged this week</div>
+      </div>
+      <button class="btn sm" onclick="logHoursForProject('${esc(p.name).replace(/'/g, "\\'")}')">Log hours</button>
+    </div>`;
+  }).join('');
+}
+
+window.logHoursForProject = function logHoursForProject(projectName) {
+  if (!myMemberId) { showToast('Your login isn\'t linked to a team member yet'); return; }
+  const existing = getProjects(selectedWeek, myMemberId).find((a) => (a.project || '').trim().toLowerCase() === projectName.trim().toLowerCase());
+  openModal(myMemberId, existing ? existing.id : null, existing ? null : projectName);
+  window.switchTab('board');
+};
+
+/* ================= Projects (per-week hour logging) ================= */
+window.openModal = function openModal(memberId, projectId, prefillProject) {
   editCtx = { memberId, projectId };
   const member = data.members.find((m) => m.id === memberId);
   document.getElementById('modalWho').textContent = `${member.name} · ${selectedWeek}`;
@@ -198,7 +335,7 @@ window.openModal = function openModal(memberId, projectId) {
     dayInputs.forEach((inp) => { inp.value = (p.days && p.days[inp.dataset.day]) ? p.days[inp.dataset.day] : ''; });
   } else {
     document.getElementById('modalTitle').textContent = 'Add project';
-    mp.value = ''; md.value = ''; mpr.value = 'Not started'; mst.value = 'Not started';
+    mp.value = prefillProject || ''; md.value = ''; mpr.value = 'Not started'; mst.value = 'Not started';
     dayInputs.forEach((inp) => inp.value = '');
   }
   updateDayTotal();
@@ -256,11 +393,14 @@ function render() {
   ws.value = selectedWeek;
   document.getElementById('capacity').value = data.capacity;
   document.getElementById('capNote').textContent = data.capacity;
+  populateProjectFilterOptions();
 
   renderStats();
   renderPeople();
   renderOverview();
   renderTeam();
+  if (document.getElementById('tab-projects') && document.getElementById('tab-projects').style.display !== 'none') renderProjectsAdmin();
+  if (document.getElementById('tab-myprojects') && document.getElementById('tab-myprojects').style.display !== 'none') renderMyProjects();
 }
 
 function renderStats() {
@@ -284,11 +424,19 @@ function renderStats() {
 function renderPeople() {
   const grid = document.getElementById('peopleGrid');
   if (!data.members.length) { grid.innerHTML = '<div class="empty">No team members yet. Add some in the Team tab.</div>'; return; }
-  grid.innerHTML = data.members.map((m) => {
+  const filterActive = isAdmin() && projectFilter;
+  let visibleMembers = data.members;
+  if (filterActive) {
+    visibleMembers = data.members.filter((m) => getProjects(selectedWeek, m.id).some((p) => (p.project || '').trim().toLowerCase() === projectFilter.trim().toLowerCase()));
+  }
+  if (filterActive && !visibleMembers.length) { grid.innerHTML = `<div class="empty">No one is logging hours against "${esc(projectFilter)}" this week.</div>`; return; }
+  grid.innerHTML = visibleMembers.map((m) => {
     const cap = memberCapacity(m);
     const hrs = memberHours(selectedWeek, m.id);
     const pct = cap > 0 ? Math.round(hrs / cap * 100) : 0;
-    const projects = getProjects(selectedWeek, m.id);
+    const projects = filterActive
+      ? getProjects(selectedWeek, m.id).filter((p) => (p.project || '').trim().toLowerCase() === projectFilter.trim().toLowerCase())
+      : getProjects(selectedWeek, m.id);
     return `
     <div class="person">
       <div class="person-head">
@@ -394,9 +542,10 @@ function renderRollup() {
     <tr><td class="nm">${esc(r.name)}</td><td>${r.hrs}h</td><td>${r.periodCap}h</td><td style="color:${loadColor(r.pct)}">${r.pct}%</td><td>${utilFlag(r.pct)}</td></tr>`).join('')
     : '<tr><td colspan="5" class="empty">No team members.</td></tr>';
 
-  const projects = aggregateProjects();
-  const delivered = projects.filter((p) => p.latestStatus === 'Done');
-  const pipeline = projects.filter((p) => p.latestStatus !== 'Done');
+  let aggregated = aggregateProjects();
+  if (isAdmin() && projectFilter) aggregated = aggregated.filter((p) => p.name.trim().toLowerCase() === projectFilter.trim().toLowerCase());
+  const delivered = aggregated.filter((p) => p.latestStatus === 'Done');
+  const pipeline = aggregated.filter((p) => p.latestStatus !== 'Done');
   document.getElementById('pipelineCount').textContent = pipeline.length;
   document.getElementById('deliveredCount').textContent = delivered.length;
   const dlInfo = (p) => p.deadline ? deadlineInfo(p.deadline).txt : '';

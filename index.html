@@ -12,11 +12,13 @@
 <div class="auth-screen" id="authScreen">
   <div class="auth-card">
     <h1>POD Board</h1>
-    <p>Sign in with your <strong>@adobe.com</strong> email. We'll send a one-time login link — no password needed.</p>
+    <p id="authIntro">Sign in with your <strong>@adobe.com</strong> email and password.</p>
     <input type="email" id="authEmail" placeholder="you@adobe.com" autocomplete="email">
-    <button class="btn primary" id="authSendBtn">Send login link</button>
+    <input type="password" id="authPassword" placeholder="Password" autocomplete="current-password">
+    <button class="btn primary" id="authSendBtn">Sign in</button>
     <div class="auth-error" id="authError"></div>
     <div class="auth-hint" id="authHint">Access is restricted to Adobe team accounts.</div>
+    <div class="auth-toggle" id="authToggleMode">Need an account? Create one</div>
   </div>
 </div>
 
@@ -56,6 +58,12 @@
       Weekly capacity
       <input type="number" id="capacity" min="1" step="1" value="40" onchange="onCapacityChange()"> hrs
     </div>
+    <div class="cap-input admin-only">
+      Filter project
+      <select class="week-select" id="projectFilterSelect" style="min-width:170px;" onchange="onProjectFilterChange()">
+        <option value="">All projects</option>
+      </select>
+    </div>
   </div>
 
   <div class="tabs">
@@ -63,6 +71,8 @@
     <div class="tab" data-tab="overview" onclick="switchTab('overview')">Capacity Overview</div>
     <div class="tab" data-tab="rollup" onclick="switchTab('rollup')">Rollup</div>
     <div class="tab" data-tab="team" onclick="switchTab('team')">Team</div>
+    <div class="tab admin-only" data-tab="projects" onclick="switchTab('projects')">Projects</div>
+    <div class="tab" data-tab="myprojects" onclick="switchTab('myprojects')">My Projects</div>
   </div>
 
   <!-- BOARD -->
@@ -129,6 +139,31 @@
         <input type="text" id="newMemberName" placeholder="Add a team member…" onkeydown="if(event.key==='Enter')addMember()">
         <button class="btn primary" onclick="addMember()">Add member</button>
       </div>
+    </div>
+  </div>
+
+  <!-- PROJECTS (admin only) -->
+  <div id="tab-projects" class="admin-only" style="display:none;">
+    <div class="card">
+      <h3>Projects (<span id="projectCount">0</span>)</h3>
+      <div id="projectAdminList"></div>
+      <div class="new-project-form">
+        <input type="text" id="newProjectName" placeholder="New project name…" onkeydown="if(event.key==='Enter')addProject()">
+        <select class="mini-select" id="newProjectStatus">
+          <option value="ongoing">Ongoing</option>
+          <option value="on_hold">On hold</option>
+          <option value="completed">Completed</option>
+        </select>
+        <button class="btn primary" onclick="addProject()">Add project</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MY PROJECTS (member view) -->
+  <div id="tab-myprojects" style="display:none;">
+    <div class="card">
+      <h3>Projects assigned to me</h3>
+      <div id="myProjectsList"></div>
     </div>
   </div>
 

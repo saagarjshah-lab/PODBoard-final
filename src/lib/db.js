@@ -104,6 +104,91 @@ export async function deleteAssignment(id) {
   if (error) throw error;
 }
 
+/* ---------------- member <-> auth-user linking ---------------- */
+
+/**
+ * If a `members` row exists whose email matches the given email and that
+ * row isn't linked to an auth user yet, links it to the given auth user id.
+ * No-ops (returns null) if no such row exists or it's already claimed by
+ * someone else — safe to call on every login.
+ */
+export async function claimMemberByEmail(email, authUserId) {
+  if (!email || !authUserId) return null;
+  const { data: rows, error } = await supabase
+    .from('members')
+    .select('id')
+    .ilike('email', email)
+    .is('auth_user_id', null)
+    .limit(1);
+  if (error || !rows || !rows.length) return null;
+  const { error: updErr } = await supabase.from('members').update({ auth_user_id: authUserId }).eq('id', rows[0].id);
+  if (updErr) return null;
+  return rows[0].id;
+}
+
+/** Returns the members.id linked to the given auth user id, or null. */
+export async function getMemberIdForAuthUser(authUserId) {
+  if (!authUserId) return null;
+  const { data, error } = await supabase.from('members').select('id').eq('auth_user_id', authUserId).maybeSingle();
+  if (error || !data) return null;
+  return data.id;
+}
+
+/* ---------------- projects (read = any adobe user, write = admin only) ---------------- */
+
+/** Fetches all projects along with which member ids are staffed on each. */
+export async function fetchProjects() {
+  const [projRes, assignRes] = await Promise.all([
+    supabase.from('projects').select('*').order('created_at', { ascending: true }),
+    supabase.from('project_assignments').select('project_id, member_id'),
+  ]);
+  if (projRes.error) throw projRes.error;
+  if (assignRes.error) throw assignRes.error;
+
+  const memberIdsByProject = {};
+  for (const row of assignRes.data) {
+    if (!memberIdsByProject[row.project_id]) memberIdsByProject[row.project_id] = [];
+    memberIdsByProject[row.project_id].push(row.member_id);
+  }
+  return projRes.data.map((p) => ({
+    id: p.id,
+    name: p.name,
+    description: p.description || '',
+    status: p.status,
+    memberIds: memberIdsByProject[p.id] || [],
+  }));
+}
+
+export async function insertProject({ name, description, status }) {
+  const { data, error } = await supabase
+    .from('projects')
+    .insert({ name, description: description || null, status: status || 'ongoing' })
+    .select()
+    .single();
+  if (error) throw error;
+  return { id: data.id, name: data.name, description: data.description || '', status: data.status, memberIds: [] };
+}
+
+export async function updateProjectStatus(id, status) {
+  const { error } = await supabase.from('projects').update({ status, updated_at: new Date().toISOString() }).eq('id', id);
+  if (error) throw error;
+}
+
+export async function deleteProjectRow(id) {
+  const { error } = await supabase.from('projects').delete().eq('id', id);
+  if (error) throw error;
+}
+
+export async function assignMemberToProject(projectId, memberId) {
+  const { error } = await supabase.from('project_assignments').insert({ project_id: projectId, member_id: memberId });
+  if (error) throw error;
+}
+
+export async function unassignMemberFromProject(projectId, memberId) {
+  const { error } = await supabase.from('project_assignments').delete().eq('project_id', projectId).eq('member_id', memberId);
+  if (error) throw error;
+}
+
 /* ---------------- realtime ---------------- */
 
 /** Subscribes to changes on all board tables; calls onChange() (debounced) for any of them. */
@@ -116,6 +201,8 @@ export function subscribeToBoard(onChange) {
     .on('postgres_changes', { event: '*', schema: 'public', table: 'assignments' }, debounced)
     .on('postgres_changes', { event: '*', schema: 'public', table: 'members' }, debounced)
     .on('postgres_changes', { event: '*', schema: 'public', table: 'app_settings' }, debounced)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'projects' }, debounced)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'project_assignments' }, debounced)
     .subscribe();
 
   return () => supabase.removeChannel(channel);
