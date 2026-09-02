@@ -1,13 +1,21 @@
 import { supabase, ALLOWED_DOMAIN } from './supabaseClient.js';
 import { claimMemberByEmail } from './db.js';
 
+// Kept in sync with public.is_admin() in supabase/schema_update.sql:
+// this account is always treated as admin, even before profiles.role is
+// manually set, so the client and the database RLS never disagree.
+const HARD_CODED_ADMIN_EMAIL = 'sashah@adobe.com';
+
 let currentSession = null;
 let currentProfile = null; // { id, email, role }
 let mode = 'signin'; // 'signin' | 'signup'
 
 export function getSession() { return currentSession; }
 export function getProfile() { return currentProfile; }
-export function isAdmin() { return currentProfile?.role === 'admin'; }
+export function isAdmin() {
+  if (!currentProfile) return false;
+  return currentProfile.role === 'admin' || (currentProfile.email || '').toLowerCase() === HARD_CODED_ADMIN_EMAIL;
+}
 
 function isAdobeEmail(email) {
   return typeof email === 'string' && email.trim().toLowerCase().endsWith(ALLOWED_DOMAIN);
@@ -134,7 +142,7 @@ export function initAuth({ onAuthed, onSignedOut }) {
     // Guard rail: a member can't force their way into the admin route by
     // editing the URL hash directly. Admins are free to view either.
     if (!currentProfile) return;
-    if (window.location.hash === '#/admin' && currentProfile.role !== 'admin') {
+    if (window.location.hash === '#/admin' && !isAdmin()) {
       window.location.hash = '#/member';
     }
   });
@@ -165,11 +173,12 @@ export function initAuth({ onAuthed, onSignedOut }) {
     // (no-ops if already linked or no matching row exists yet).
     claimMemberByEmail(email, session.user.id).catch(() => {});
 
+    const admin = isAdmin();
     showApp();
-    document.body.classList.toggle('role-member', currentProfile.role !== 'admin');
+    document.body.classList.toggle('role-member', !admin);
     document.getElementById('whoEmail').textContent = currentProfile.email;
-    document.getElementById('whoRole').textContent = currentProfile.role;
-    routeForRole(currentProfile.role);
+    document.getElementById('whoRole').textContent = admin ? 'admin' : currentProfile.role;
+    routeForRole(admin ? 'admin' : 'member');
     onAuthed?.(currentProfile);
   });
 }

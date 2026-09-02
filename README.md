@@ -1,5 +1,36 @@
 # POD Board — Weekly Capacity Tracker (production)
 
+## Strict Admin/Member workspace isolation (latest upgrade)
+This version splits the app into two fully separate workspaces, gated by role:
+
+- **Admin Workspace** (`sashah@adobe.com`, or any `profiles.role = 'admin'`):
+  everything from before (Week Board, Capacity Overview, Rollup, Team, Projects)
+  plus a new **Live Tracking** tab — pick an ongoing project from a dropdown and
+  see who's assigned, cumulative time logged per person, and recent entries.
+- **Member Workspace** (everyone else): a completely separate view. Members
+  never see the admin tabs, other members' data, or unassigned projects. They get:
+  - **My projects** — only the projects an admin staffed them on.
+  - **Live timer** — Start/Pause/Resume/Stop against a chosen project; Stop
+    saves a `time_logs` row.
+  - **Manual time entry** — date + hours/minutes + notes for past work.
+  - **Personal summary** — their own this-week and all-time hours only.
+
+**Run `supabase/schema_update.sql`** — it's a fresh, fully self-contained,
+idempotent script that adds `time_logs`, tightens RLS on `members`/`assignments`/
+`projects`/`project_assignments` to the strict model described in its header
+comments, and re-seeds `sashah@adobe.com` as admin. Safe to run whether or not
+earlier versions of this file were already applied.
+
+**Team tab change**: adding a member now requires an `@adobe.com` email
+up front (previously optional) — it's what lets that person's login link to
+their member record and see their own workspace.
+
+**Note on the timer**: it runs in-memory only; refreshing the page or closing
+the tab while it's running discards unsaved time. Click "Stop & save" before
+navigating away.
+
+---
+
 Vanilla JS + Vite frontend, Supabase for auth/data/realtime, deployed as a static
 site on Render. Feature-for-feature port of the original HTML mock: week board,
 capacity overview, monthly/quarterly rollup, team management, Excel import/export,

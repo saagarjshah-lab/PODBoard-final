@@ -3,9 +3,11 @@ import { supabase } from './supabaseClient.js';
 const DAY_COLS = ['mon', 'tue', 'wed', 'thu', 'fri'];
 
 /**
- * Fetches all board state and reshapes it into the nested object the
- * original app's render functions expect:
- *   { appName, tagline, capacity, logo, members:[{id,name,capacity}],
+ * Fetches all ADMIN board state and reshapes it into the nested object the
+ * admin render functions expect. Admin-only: RLS scopes `members` and
+ * `assignments` to admins; a member session would get an empty/partial
+ * result here, which is why the Member Workspace never calls this.
+ *   { appName, tagline, capacity, logo, members:[{id,name,capacity,email,authUserId}],
  *     assignments: { [weekLabel]: { [memberId]: [ {id, project, deadline, days, priority, status} ] } } }
  */
 export async function fetchBoard() {
@@ -20,7 +22,9 @@ export async function fetchBoard() {
   if (assignmentsRes.error) throw assignmentsRes.error;
 
   const settings = settingsRes.data;
-  const members = membersRes.data.map((m) => ({ id: m.id, name: m.name, capacity: Number(m.capacity) }));
+  const members = membersRes.data.map((m) => ({
+    id: m.id, name: m.name, capacity: Number(m.capacity), email: m.email || '', authUserId: m.auth_user_id || null,
+  }));
 
   const assignments = {};
   for (const row of assignmentsRes.data) {
@@ -46,6 +50,23 @@ export async function fetchBoard() {
   };
 }
 
+/**
+ * Lightweight branding-only fetch used by the Member Workspace (which never
+ * calls fetchBoard, since `members`/`assignments` are admin-scoped by RLS).
+ * `app_settings` itself stays readable by any signed-in @adobe.com user —
+ * it's just branding, nothing member-sensitive.
+ */
+export async function fetchAppSettingsOnly() {
+  const { data, error } = await supabase.from('app_settings').select('*').eq('id', 1).single();
+  if (error) throw error;
+  return {
+    appName: data.app_name,
+    tagline: data.tagline,
+    capacity: Number(data.default_capacity),
+    logo: data.logo_data || null,
+  };
+}
+
 /* ---------------- app_settings (admin only, enforced by RLS) ---------------- */
 
 export async function updateAppSettings(patch) {
@@ -55,10 +76,12 @@ export async function updateAppSettings(patch) {
 
 /* ---------------- members (write = admin only, enforced by RLS) ---------------- */
 
-export async function insertMember(name, capacity) {
-  const { data, error } = await supabase.from('members').insert({ name, capacity }).select().single();
+export async function insertMember(name, capacity, email) {
+  const payload = { name, capacity };
+  if (email) payload.email = email;
+  const { data, error } = await supabase.from('members').insert(payload).select().single();
   if (error) throw error;
-  return { id: data.id, name: data.name, capacity: Number(data.capacity) };
+  return { id: data.id, name: data.name, capacity: Number(data.capacity), email: data.email || '', authUserId: data.auth_user_id || null };
 }
 
 export async function updateMemberCapacity(id, capacity) {
@@ -66,13 +89,18 @@ export async function updateMemberCapacity(id, capacity) {
   if (error) throw error;
 }
 
+export async function updateMemberEmail(id, email) {
+  const { error } = await supabase.from('members').update({ email: email || null }).eq('id', id);
+  if (error) throw error;
+}
+
 export async function deleteMember(id) {
-  // ON DELETE CASCADE on assignments.member_id removes their rows too.
+  // ON DELETE CASCADE on assignments.member_id / project_assignments.member_id removes their rows too.
   const { error } = await supabase.from('members').delete().eq('id', id);
   if (error) throw error;
 }
 
-/* ---------------- assignments / projects (any signed-in @adobe.com user) ---------------- */
+/* ---------------- assignments (legacy per-week hour log; admin-only end to end) ---------------- */
 
 export async function upsertAssignment({ id, weekLabel, memberId, project, deadline, days, priority, status }) {
   const row = {
@@ -134,9 +162,9 @@ export async function getMemberIdForAuthUser(authUserId) {
   return data.id;
 }
 
-/* ---------------- projects (read = any adobe user, write = admin only) ---------------- */
+/* ---------------- projects (read scoped by RLS: admin = all, member = assigned only) ---------------- */
 
-/** Fetches all projects along with which member ids are staffed on each. */
+/** Fetches projects visible to the current user, along with which member ids are staffed on each. */
 export async function fetchProjects() {
   const [projRes, assignRes] = await Promise.all([
     supabase.from('projects').select('*').order('created_at', { ascending: true }),
@@ -189,6 +217,54 @@ export async function unassignMemberFromProject(projectId, memberId) {
   if (error) throw error;
 }
 
+/* ---------------- time_logs (member: own rows only; admin: all rows) ---------------- */
+
+/**
+ * Fetches time log rows, newest first. Pass `userId` and/or `projectId` to
+ * narrow the query — RLS enforces that a non-admin can only ever get their
+ * own rows back regardless of what filters are passed.
+ */
+export async function fetchTimeLogs({ userId, projectId } = {}) {
+  let q = supabase.from('time_logs').select('*').order('start_time', { ascending: false });
+  if (userId) q = q.eq('user_id', userId);
+  if (projectId) q = q.eq('project_id', projectId);
+  const { data, error } = await q;
+  if (error) throw error;
+  return data.map((r) => ({
+    id: r.id,
+    userId: r.user_id,
+    projectId: r.project_id,
+    duration: Number(r.duration) || 0,
+    startTime: r.start_time,
+    endTime: r.end_time,
+    notes: r.notes || '',
+    isManual: !!r.is_manual,
+  }));
+}
+
+export async function insertTimeLog({ userId, projectId, durationSeconds, startTime, endTime, notes, isManual }) {
+  const { data, error } = await supabase
+    .from('time_logs')
+    .insert({
+      user_id: userId,
+      project_id: projectId,
+      duration: Math.max(0, Math.round(durationSeconds) || 0),
+      start_time: startTime || new Date().toISOString(),
+      end_time: endTime || null,
+      notes: notes || null,
+      is_manual: !!isManual,
+    })
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+export async function updateTimeLog(id, patch) {
+  const { error } = await supabase.from('time_logs').update({ ...patch, updated_at: new Date().toISOString() }).eq('id', id);
+  if (error) throw error;
+}
+
 /* ---------------- realtime ---------------- */
 
 /** Subscribes to changes on all board tables; calls onChange() (debounced) for any of them. */
@@ -203,6 +279,7 @@ export function subscribeToBoard(onChange) {
     .on('postgres_changes', { event: '*', schema: 'public', table: 'app_settings' }, debounced)
     .on('postgres_changes', { event: '*', schema: 'public', table: 'projects' }, debounced)
     .on('postgres_changes', { event: '*', schema: 'public', table: 'project_assignments' }, debounced)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'time_logs' }, debounced)
     .subscribe();
 
   return () => supabase.removeChannel(channel);

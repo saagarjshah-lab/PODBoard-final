@@ -222,3 +222,35 @@ body.role-member .admin-only{display:none !important;}
 .new-project-form input[type=text]{flex:1;min-width:180px;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:9px 12px;font-size:13px;font-family:inherit;}
 .project-del-sm{color:var(--text-dim);cursor:pointer;font-size:12px;}
 .project-del-sm:hover{color:var(--danger);}
+
+/* ================= Strict workspace isolation (added) ================= */
+body:not(.role-member) .member-only{display:none !important;}
+.add-member{flex-wrap:wrap;}
+.add-member input[type=email]{max-width:220px;}
+
+/* ================= Member workspace: live timer (added) ================= */
+.timer-widget{display:flex;align-items:center;gap:18px;flex-wrap:wrap;margin-top:8px;}
+.timer-display{font-family:'IBM Plex Mono';font-size:30px;font-weight:600;color:var(--accent);letter-spacing:1px;min-width:140px;}
+.timer-controls{display:flex;gap:8px;flex-wrap:wrap;}
+
+/* ================= Member workspace: manual time entry (added) ================= */
+.manual-entry-form{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px;}
+.manual-entry-form input[type=date],
+.manual-entry-form input[type=number]{background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:9px 11px;font-size:13px;font-family:inherit;}
+.manual-entry-form input[type=number]{width:88px;}
+.manual-entry-form input[type=text]{flex:1;min-width:160px;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:9px 12px;font-size:13px;font-family:inherit;}
+
+/* ================= Time log list rows (added, reuses .proj-item pattern) ================= */
+.log-item{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:11px 0;border-bottom:1px solid var(--border);}
+.log-item:last-child{border-bottom:none;}
+.log-item .lname{font-weight:600;font-size:13.5px;}
+.log-item .lmeta{font-size:11px;color:var(--text-muted);margin-top:3px;}
+.log-item .lhrs{font-family:'IBM Plex Mono';font-size:12px;color:var(--text);white-space:nowrap;text-align:right;}
+.log-tag{font-size:10px;text-transform:uppercase;letter-spacing:.5px;padding:2px 7px;border-radius:20px;background:var(--surface3);color:var(--text-dim);margin-left:6px;}
+.log-edit{color:var(--text-dim);cursor:pointer;font-size:11px;margin-left:8px;}
+.log-edit:hover{color:var(--accent);}
+
+/* ================= Live tracking (admin, added) ================= */
+.livetrack-member-row{display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid var(--border);font-size:13px;}
+.livetrack-member-row:last-child{border-bottom:none;}
+.livetrack-member-row .lt-hours{font-family:'IBM Plex Mono';font-size:12.5px;color:var(--teal);}

@@ -25,6 +25,7 @@
 <!-- ============ APP (hidden until authenticated) ============ -->
 <div class="app hidden" id="appRoot">
 
+  <!-- Common chrome: shown to both workspaces -->
   <div class="header">
     <div class="brand">
       <div class="mark-wrap">
@@ -40,136 +41,197 @@
     </div>
     <div class="header-actions">
       <span class="who-badge"><span id="whoEmail"></span><span class="role-pill" id="whoRole"></span></span>
-      <input type="file" id="importFile" accept=".xlsx,.xls,.csv">
-      <button class="btn sm" onclick="document.getElementById('importFile').click()">Import sheet</button>
-      <button class="btn sm" onclick="exportExcel()">Export sheet</button>
+      <span class="admin-only" style="display:contents;">
+        <input type="file" id="importFile" accept=".xlsx,.xls,.csv">
+        <button class="btn sm" onclick="document.getElementById('importFile').click()">Import sheet</button>
+        <button class="btn sm" onclick="exportExcel()">Export sheet</button>
+      </span>
       <button class="btn sm ghost" id="signOutBtn">Sign out</button>
     </div>
   </div>
 
-  <div class="banner">Each person logs their <strong>actual hours per day (Mon–Fri)</strong> against every project they work on. The weekly total rolls up into <strong>% Occupied</strong> against that person's <span id="capNote">40</span>-hour capacity. This board is shared live with your whole Adobe team.</div>
+  <!-- ============ ADMIN WORKSPACE (admins only) ============ -->
+  <div id="adminWorkspace" class="admin-only">
 
-  <div class="toolbar">
-    <div class="week-picker">
-      <label>Week</label>
-      <select class="week-select" id="weekSelect" onchange="onWeekChange()"></select>
-    </div>
-    <div class="cap-input admin-only">
-      Weekly capacity
-      <input type="number" id="capacity" min="1" step="1" value="40" onchange="onCapacityChange()"> hrs
-    </div>
-    <div class="cap-input admin-only">
-      Filter project
-      <select class="week-select" id="projectFilterSelect" style="min-width:170px;" onchange="onProjectFilterChange()">
-        <option value="">All projects</option>
-      </select>
-    </div>
-  </div>
+    <div class="banner">This is the admin control center. Each person logs their <strong>actual hours per day (Mon–Fri)</strong> against every project they work on. The weekly total rolls up into <strong>% Occupied</strong> against that person's <span id="capNote">40</span>-hour capacity.</div>
 
-  <div class="tabs">
-    <div class="tab active" data-tab="board" onclick="switchTab('board')">Week Board</div>
-    <div class="tab" data-tab="overview" onclick="switchTab('overview')">Capacity Overview</div>
-    <div class="tab" data-tab="rollup" onclick="switchTab('rollup')">Rollup</div>
-    <div class="tab" data-tab="team" onclick="switchTab('team')">Team</div>
-    <div class="tab admin-only" data-tab="projects" onclick="switchTab('projects')">Projects</div>
-    <div class="tab" data-tab="myprojects" onclick="switchTab('myprojects')">My Projects</div>
-  </div>
-
-  <!-- BOARD -->
-  <div id="tab-board">
-    <div class="stats" id="statStrip"></div>
-    <div class="people" id="peopleGrid"></div>
-  </div>
-
-  <!-- OVERVIEW -->
-  <div id="tab-overview" style="display:none;">
-    <div class="card">
-      <h3 id="ovTitle">Capacity by person</h3>
-      <div class="ov-list" id="ovList"></div>
-      <div class="legend">
-        <span><i class="dot" style="background:var(--blue)"></i>Under 70% — capacity free</span>
-        <span><i class="dot" style="background:var(--teal)"></i>70–90% — healthy</span>
-        <span><i class="dot" style="background:var(--accent)"></i>90–100% — full</span>
-        <span><i class="dot" style="background:var(--danger)"></i>Over 100% — overloaded</span>
+    <div class="toolbar">
+      <div class="week-picker">
+        <label>Week</label>
+        <select class="week-select" id="weekSelect" onchange="onWeekChange()"></select>
       </div>
-    </div>
-  </div>
-
-  <!-- ROLLUP -->
-  <div id="tab-rollup" style="display:none;">
-    <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:6px;">
-      <div class="scope-toggle">
-        <button id="scopeMonth" class="active" onclick="setScope('month')">Monthly</button>
-        <button id="scopeQuarter" onclick="setScope('quarter')">Quarterly</button>
+      <div class="cap-input">
+        Weekly capacity
+        <input type="number" id="capacity" min="1" step="1" value="40" onchange="onCapacityChange()"> hrs
       </div>
-      <select class="week-select" id="periodSelect" onchange="renderRollup()" style="min-width:180px;"></select>
-    </div>
-    <div class="stats" id="rollupStats" style="margin-top:16px;"></div>
-    <div class="card">
-      <h3 id="rollupTableTitle">Utilization by person</h3>
-      <table class="rtable">
-        <thead><tr><th>Member</th><th>Hours</th><th>Capacity</th><th>Avg %</th><th>Status</th></tr></thead>
-        <tbody id="rollupTable"></tbody>
-      </table>
-      <div class="legend">
-        <span><i class="dot" style="background:var(--blue)"></i>Under 70% — has availability</span>
-        <span><i class="dot" style="background:var(--teal)"></i>70–90% — healthy</span>
-        <span><i class="dot" style="background:var(--accent)"></i>90–100% — full</span>
-        <span><i class="dot" style="background:var(--danger)"></i>Over 100% — overloaded</span>
-      </div>
-    </div>
-    <div class="rollup-cols">
-      <div class="card">
-        <h3>In pipeline <span class="count-pill" id="pipelineCount">0</span></h3>
-        <div id="pipelineList"></div>
-      </div>
-      <div class="card">
-        <h3>Delivered <span class="count-pill" id="deliveredCount">0</span></h3>
-        <div id="deliveredList"></div>
-      </div>
-    </div>
-  </div>
-
-  <!-- TEAM -->
-  <div id="tab-team" style="display:none;">
-    <div class="card">
-      <h3>Team members (<span id="memberCount">0</span>)</h3>
-      <div class="ov-list" id="teamList"></div>
-      <div class="add-member admin-only">
-        <input type="text" id="newMemberName" placeholder="Add a team member…" onkeydown="if(event.key==='Enter')addMember()">
-        <button class="btn primary" onclick="addMember()">Add member</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- PROJECTS (admin only) -->
-  <div id="tab-projects" class="admin-only" style="display:none;">
-    <div class="card">
-      <h3>Projects (<span id="projectCount">0</span>)</h3>
-      <div id="projectAdminList"></div>
-      <div class="new-project-form">
-        <input type="text" id="newProjectName" placeholder="New project name…" onkeydown="if(event.key==='Enter')addProject()">
-        <select class="mini-select" id="newProjectStatus">
-          <option value="ongoing">Ongoing</option>
-          <option value="on_hold">On hold</option>
-          <option value="completed">Completed</option>
+      <div class="cap-input">
+        Filter project
+        <select class="week-select" id="projectFilterSelect" style="min-width:170px;" onchange="onProjectFilterChange()">
+          <option value="">All projects</option>
         </select>
-        <button class="btn primary" onclick="addProject()">Add project</button>
       </div>
     </div>
+
+    <div class="tabs">
+      <div class="tab active" data-tab="board" onclick="switchTab('board')">Week Board</div>
+      <div class="tab" data-tab="overview" onclick="switchTab('overview')">Capacity Overview</div>
+      <div class="tab" data-tab="rollup" onclick="switchTab('rollup')">Rollup</div>
+      <div class="tab" data-tab="team" onclick="switchTab('team')">Team</div>
+      <div class="tab" data-tab="projects" onclick="switchTab('projects')">Projects</div>
+      <div class="tab" data-tab="livetracking" onclick="switchTab('livetracking')">Live Tracking</div>
+    </div>
+
+    <!-- BOARD -->
+    <div id="tab-board">
+      <div class="stats" id="statStrip"></div>
+      <div class="people" id="peopleGrid"></div>
+    </div>
+
+    <!-- OVERVIEW -->
+    <div id="tab-overview" style="display:none;">
+      <div class="card">
+        <h3 id="ovTitle">Capacity by person</h3>
+        <div class="ov-list" id="ovList"></div>
+        <div class="legend">
+          <span><i class="dot" style="background:var(--blue)"></i>Under 70% — capacity free</span>
+          <span><i class="dot" style="background:var(--teal)"></i>70–90% — healthy</span>
+          <span><i class="dot" style="background:var(--accent)"></i>90–100% — full</span>
+          <span><i class="dot" style="background:var(--danger)"></i>Over 100% — overloaded</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ROLLUP -->
+    <div id="tab-rollup" style="display:none;">
+      <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:6px;">
+        <div class="scope-toggle">
+          <button id="scopeMonth" class="active" onclick="setScope('month')">Monthly</button>
+          <button id="scopeQuarter" onclick="setScope('quarter')">Quarterly</button>
+        </div>
+        <select class="week-select" id="periodSelect" onchange="renderRollup()" style="min-width:180px;"></select>
+      </div>
+      <div class="stats" id="rollupStats" style="margin-top:16px;"></div>
+      <div class="card">
+        <h3 id="rollupTableTitle">Utilization by person</h3>
+        <table class="rtable">
+          <thead><tr><th>Member</th><th>Hours</th><th>Capacity</th><th>Avg %</th><th>Status</th></tr></thead>
+          <tbody id="rollupTable"></tbody>
+        </table>
+        <div class="legend">
+          <span><i class="dot" style="background:var(--blue)"></i>Under 70% — has availability</span>
+          <span><i class="dot" style="background:var(--teal)"></i>70–90% — healthy</span>
+          <span><i class="dot" style="background:var(--accent)"></i>90–100% — full</span>
+          <span><i class="dot" style="background:var(--danger)"></i>Over 100% — overloaded</span>
+        </div>
+      </div>
+      <div class="rollup-cols">
+        <div class="card">
+          <h3>In pipeline <span class="count-pill" id="pipelineCount">0</span></h3>
+          <div id="pipelineList"></div>
+        </div>
+        <div class="card">
+          <h3>Delivered <span class="count-pill" id="deliveredCount">0</span></h3>
+          <div id="deliveredList"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- TEAM -->
+    <div id="tab-team" style="display:none;">
+      <div class="card">
+        <h3>Team members (<span id="memberCount">0</span>)</h3>
+        <div class="ov-list" id="teamList"></div>
+        <div class="add-member">
+          <input type="text" id="newMemberName" placeholder="Full name…" onkeydown="if(event.key==='Enter')addMember()">
+          <input type="email" id="newMemberEmail" placeholder="email@adobe.com" required onkeydown="if(event.key==='Enter')addMember()">
+          <button class="btn primary" onclick="addMember()">Add member</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- PROJECTS -->
+    <div id="tab-projects" style="display:none;">
+      <div class="card">
+        <h3>Projects (<span id="projectCount">0</span>)</h3>
+        <div id="projectAdminList"></div>
+        <div class="new-project-form">
+          <input type="text" id="newProjectName" placeholder="New project name…" onkeydown="if(event.key==='Enter')addProject()">
+          <select class="mini-select" id="newProjectStatus">
+            <option value="ongoing">Ongoing</option>
+            <option value="on_hold">On hold</option>
+            <option value="completed">Completed</option>
+          </select>
+          <button class="btn primary" onclick="addProject()">Add project</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- LIVE TRACKING -->
+    <div id="tab-livetracking" style="display:none;">
+      <div class="card">
+        <h3>Live tracking</h3>
+        <div class="week-picker" style="margin-bottom:4px;">
+          <label>Ongoing project</label>
+          <select class="week-select" id="liveTrackProjectSelect" style="min-width:220px;" onchange="renderLiveTracking()"></select>
+        </div>
+        <div class="stats" id="liveTrackStats" style="margin-top:16px;"></div>
+        <h3 style="margin-top:22px;">Assigned members</h3>
+        <div id="liveTrackMembers"></div>
+        <h3 style="margin-top:22px;">Recent time logs</h3>
+        <div id="liveTrackLogs"></div>
+      </div>
+    </div>
+
   </div>
 
-  <!-- MY PROJECTS (member view) -->
-  <div id="tab-myprojects" style="display:none;">
+  <!-- ============ MEMBER WORKSPACE (members only) ============ -->
+  <div id="memberWorkspace" class="member-only">
+
+    <div class="banner">Welcome back. This workspace only shows the projects assigned to you and your own time logs — no one else's data is visible here.</div>
+
+    <div class="stats" id="memberStatStrip"></div>
+
     <div class="card">
-      <h3>Projects assigned to me</h3>
-      <div id="myProjectsList"></div>
+      <h3>Live timer</h3>
+      <div class="timer-widget">
+        <select class="week-select" id="timerProjectSelect" style="min-width:220px;"></select>
+        <div class="timer-display" id="timerDisplay">00:00:00</div>
+        <div class="timer-controls">
+          <button class="btn primary" id="timerStartBtn" onclick="startTimer()">Start</button>
+          <button class="btn" id="timerPauseBtn" onclick="pauseTimer()" style="display:none;">Pause</button>
+          <button class="btn" id="timerResumeBtn" onclick="resumeTimer()" style="display:none;">Resume</button>
+          <button class="btn ghost" id="timerStopBtn" onclick="stopTimer()" style="display:none;">Stop &amp; save</button>
+        </div>
+      </div>
     </div>
+
+    <div class="card">
+      <h3>Log time manually</h3>
+      <div class="manual-entry-form">
+        <select class="week-select" id="manualProjectSelect" style="min-width:200px;"></select>
+        <input type="date" id="manualDate">
+        <input type="number" min="0" step="1" id="manualHours" placeholder="Hours">
+        <input type="number" min="0" max="59" step="1" id="manualMinutes" placeholder="Minutes">
+        <input type="text" id="manualNotes" placeholder="Notes (optional)">
+        <button class="btn primary" onclick="submitManualEntry()">Log time</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>My projects</h3>
+      <div id="memberProjectsList"></div>
+    </div>
+
+    <div class="card">
+      <h3>Recent time logs</h3>
+      <div id="memberLogsList"></div>
+    </div>
+
   </div>
 
 </div>
 
-<!-- Project modal -->
+<!-- Project modal (admin week-board hour logging) -->
 <div class="modal-bg" id="modalBg">
   <div class="modal">
     <h3 id="modalTitle">Add project</h3>

@@ -1,19 +1,21 @@
 import * as XLSX from 'xlsx';
 import { initAuth, isAdmin, getSession } from './lib/auth.js';
+import { ALLOWED_DOMAIN } from './lib/supabaseClient.js';
 import {
-  fetchBoard, updateAppSettings, insertMember, updateMemberCapacity, deleteMember,
+  fetchBoard, fetchAppSettingsOnly, updateAppSettings, insertMember, updateMemberCapacity, updateMemberEmail, deleteMember,
   upsertAssignment, deleteAssignment, subscribeToBoard,
   fetchProjects, insertProject, updateProjectStatus, deleteProjectRow,
   assignMemberToProject, unassignMemberFromProject, getMemberIdForAuthUser,
+  fetchTimeLogs, insertTimeLog, updateTimeLog,
 } from './lib/db.js';
 
-/* ================= State ================= */
+/* ================= State (admin workspace) ================= */
 let data = { appName: 'POD Board', tagline: 'Weekly Capacity Tracker', capacity: 40, members: [], assignments: {} };
 let weeks = [];
 let selectedWeek = null;
 let editCtx = null; // {memberId, projectId|null}
 let unsubscribeRealtime = null;
-let projects = []; // [{id,name,description,status,memberIds}]
+let projects = []; // [{id,name,description,status,memberIds}] — RLS-scoped: all for admin, assigned-only for members
 let projectFilter = ''; // '' = all projects; else a project name (admin ongoing-projects dropdown)
 let myMemberId = null; // members.id linked to the current auth user, if any
 
@@ -89,19 +91,18 @@ function currentWeekLabel() {
   return weekLabel(mon);
 }
 
-/* ================= Data load (Supabase) ================= */
+/* ================= Data load (Supabase) — admin workspace ================= */
 async function loadData() {
   data = await fetchBoard();
   Object.keys(data.assignments).forEach((w) => { if (!weeks.includes(w)) weeks.push(w); });
   try { projects = await fetchProjects(); } catch (e) { projects = []; }
-  try {
-    const session = getSession();
-    myMemberId = session ? await getMemberIdForAuthUser(session.user.id) : null;
-  } catch (e) { myMemberId = null; }
 }
-async function reload() { await loadData(); render(); }
+async function reload() {
+  if (isAdmin()) { await loadData(); render(); }
+  else { await loadMemberWorkspaceData(); renderMemberWorkspace(); }
+}
 
-/* ================= Helpers ================= */
+/* ================= Helpers (shared) ================= */
 function showToast(m) { const t = document.getElementById('toast'); t.textContent = m; t.classList.add('show'); setTimeout(() => t.classList.remove('show'), 1800); }
 function initials(name) { return name.trim().split(/\s+/).map((w) => w[0]).slice(0, 2).join('').toUpperCase(); }
 function getProjects(week, memberId) { return (data.assignments[week] && data.assignments[week][memberId]) || []; }
@@ -135,17 +136,29 @@ function utilFlag(pct) {
   if (pct >= 70) return '<span class="flag flag-ok">Healthy</span>';
   return '<span class="flag flag-free">Has availability</span>';
 }
+function formatDuration(seconds) {
+  const s = Math.max(0, Math.round(seconds || 0));
+  const h = Math.floor(s / 3600), m = Math.round((s % 3600) / 60);
+  if (h && m) return `${h}h ${m}m`;
+  if (h) return `${h}h`;
+  return `${m}m`;
+}
+function formatLogDate(iso) {
+  if (!iso) return '';
+  const d = new Date(iso); if (isNaN(d)) return '';
+  return `${pad(d.getDate())} ${MONTHS[d.getMonth()]} ${d.getFullYear()}`;
+}
 
-/* ================= Tabs / controls ================= */
+/* ================= Tabs / controls (admin workspace) ================= */
 window.switchTab = function switchTab(tab) {
   document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === tab));
-  ['board', 'overview', 'rollup', 'team', 'projects', 'myprojects'].forEach((t) => {
+  ['board', 'overview', 'rollup', 'team', 'projects', 'livetracking'].forEach((t) => {
     const el = document.getElementById('tab-' + t);
     if (el) el.style.display = t === tab ? 'block' : 'none';
   });
   if (tab === 'rollup') renderRollup();
   if (tab === 'projects') renderProjectsAdmin();
-  if (tab === 'myprojects') renderMyProjects();
+  if (tab === 'livetracking') { populateLiveTrackProjectOptions(); renderLiveTracking(); }
 };
 window.setScope = function setScope(scope) {
   rollupScope = scope;
@@ -171,16 +184,28 @@ window.onCapacityChange = async function onCapacityChange() {
   render();
 };
 
-/* ================= Members ================= */
+/* ================= Members (admin workspace) ================= */
 window.addMember = async function addMember() {
   const el = document.getElementById('newMemberName');
+  const emailEl = document.getElementById('newMemberEmail');
   const name = el.value.trim();
+  const email = (emailEl?.value || '').trim().toLowerCase();
   if (!name) { showToast('Enter a name'); return; }
+  if (!email || !email.endsWith(ALLOWED_DOMAIN)) { showToast(`A valid ${ALLOWED_DOMAIN} email is required`); return; }
   try {
-    const m = await insertMember(name, data.capacity);
+    const m = await insertMember(name, data.capacity, email);
     data.members.push(m);
-    el.value = ''; render(); showToast('Member added');
-  } catch (e) { showToast('Only admins can add members'); }
+    el.value = ''; if (emailEl) emailEl.value = '';
+    render(); showToast('Member added');
+  } catch (e) { showToast(/duplicate|unique/i.test(e?.message || '') ? 'That email is already in use' : 'Only admins can add members'); }
+};
+window.setMemberEmail = async function setMemberEmail(id, val) {
+  const email = (val || '').trim().toLowerCase();
+  if (email && !email.endsWith(ALLOWED_DOMAIN)) { showToast(`Email must end with ${ALLOWED_DOMAIN}`); render(); return; }
+  const m = data.members.find((x) => x.id === id); if (!m) return;
+  try { await updateMemberEmail(id, email); m.email = email; showToast(email ? 'Email saved — they can now sign in and see their projects' : 'Email cleared'); }
+  catch (e) { showToast('Only admins can edit member email'); }
+  render();
 };
 window.setMemberCapacity = async function setMemberCapacity(id, val) {
   const m = data.members.find((x) => x.id === id); if (!m) return;
@@ -289,38 +314,63 @@ function renderProjectsAdmin() {
     </div>`).join('') : '<div class="empty">No projects yet — add one below.</div>';
 }
 
-async function renderMyProjects() {
-  const el = document.getElementById('myProjectsList');
-  if (!el) return;
-  const session = getSession();
-  if (session) { try { myMemberId = await getMemberIdForAuthUser(session.user.id); } catch (e) { /* keep previous value */ } }
-  if (!myMemberId) {
-    el.innerHTML = '<div class="empty">Your login isn\'t linked to a team member yet. Ask your admin to add you in the Team tab using this same email address.</div>';
-    return;
-  }
-  const mine = projects.filter((p) => p.memberIds.includes(myMemberId));
-  if (!mine.length) { el.innerHTML = '<div class="empty">No projects assigned to you yet.</div>'; return; }
-  el.innerHTML = mine.map((p) => {
-    const hrsThisWeek = getProjects(selectedWeek, myMemberId).filter((a) => (a.project || '').trim().toLowerCase() === p.name.trim().toLowerCase()).reduce((s, a) => s + projectHours(a), 0);
-    return `
-    <div class="proj-item">
-      <div>
-        <div class="pname">${esc(p.name)}</div>
-        <div class="pmeta">Status: ${esc(p.status.replace('_', ' '))} · ${hrsThisWeek}h logged this week</div>
-      </div>
-      <button class="btn sm" onclick="logHoursForProject('${esc(p.name).replace(/'/g, "\\'")}')">Log hours</button>
-    </div>`;
-  }).join('');
+/* ================= Live Tracking (admin workspace, NEW) ================= */
+function populateLiveTrackProjectOptions() {
+  const sel = document.getElementById('liveTrackProjectSelect');
+  if (!sel) return;
+  const prev = sel.value;
+  const ongoing = projects.filter((p) => p.status === 'ongoing');
+  sel.innerHTML = ongoing.length
+    ? ongoing.map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join('')
+    : '<option value="">No ongoing projects</option>';
+  if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
 }
 
-window.logHoursForProject = function logHoursForProject(projectName) {
-  if (!myMemberId) { showToast('Your login isn\'t linked to a team member yet'); return; }
-  const existing = getProjects(selectedWeek, myMemberId).find((a) => (a.project || '').trim().toLowerCase() === projectName.trim().toLowerCase());
-  openModal(myMemberId, existing ? existing.id : null, existing ? null : projectName);
-  window.switchTab('board');
-};
+async function renderLiveTracking() {
+  const sel = document.getElementById('liveTrackProjectSelect');
+  const statsEl = document.getElementById('liveTrackStats');
+  const membersEl = document.getElementById('liveTrackMembers');
+  const logsEl = document.getElementById('liveTrackLogs');
+  if (!sel || !statsEl || !membersEl || !logsEl) return;
+  const projectId = sel.value;
+  const project = projects.find((p) => p.id === projectId);
+  if (!project) {
+    statsEl.innerHTML = ''; membersEl.innerHTML = '<div class="empty">Create an ongoing project to see live tracking.</div>'; logsEl.innerHTML = '';
+    return;
+  }
 
-/* ================= Projects (per-week hour logging) ================= */
+  let logs = [];
+  try { logs = await fetchTimeLogs({ projectId }); } catch (e) { logs = []; }
+
+  const assignedMembers = data.members.filter((m) => project.memberIds.includes(m.id));
+  const hoursByAuthUser = {};
+  logs.forEach((l) => { hoursByAuthUser[l.userId] = (hoursByAuthUser[l.userId] || 0) + l.duration; });
+  const totalSeconds = logs.reduce((s, l) => s + l.duration, 0);
+
+  statsEl.innerHTML = `
+    <div class="stat"><div class="label">Assigned members</div><div class="value">${assignedMembers.length}</div></div>
+    <div class="stat"><div class="label">Total logged</div><div class="value teal">${formatDuration(totalSeconds)}</div></div>
+    <div class="stat"><div class="label">Time entries</div><div class="value">${logs.length}</div></div>
+    <div class="stat"><div class="label">Status</div><div class="value">${esc(project.status.replace('_', ' '))}</div></div>
+  `;
+
+  membersEl.innerHTML = assignedMembers.length ? assignedMembers.map((m) => {
+    const secs = m.authUserId ? (hoursByAuthUser[m.authUserId] || 0) : 0;
+    return `<div class="livetrack-member-row"><span>${esc(m.name)}</span><span class="lt-hours">${formatDuration(secs)}</span></div>`;
+  }).join('') : '<div class="empty">No one is assigned to this project yet — assign members in the Projects tab.</div>';
+
+  const nameFor = (authUserId) => (data.members.find((m) => m.authUserId === authUserId)?.name) || 'Unknown member';
+  logsEl.innerHTML = logs.length ? logs.slice(0, 25).map((l) => `
+    <div class="log-item">
+      <div>
+        <div class="lname">${esc(nameFor(l.userId))}</div>
+        <div class="lmeta">${formatLogDate(l.startTime)}${l.notes ? ' · ' + esc(l.notes) : ''}<span class="log-tag">${l.isManual ? 'manual' : 'timer'}</span></div>
+      </div>
+      <div class="lhrs">${formatDuration(l.duration)}</div>
+    </div>`).join('') : '<div class="empty">No time logged against this project yet.</div>';
+}
+
+/* ================= Projects (per-week hour logging — admin workspace) ================= */
 window.openModal = function openModal(memberId, projectId, prefillProject) {
   editCtx = { memberId, projectId };
   const member = data.members.find((m) => m.id === memberId);
@@ -384,7 +434,7 @@ window.deleteProject = async function deleteProject(memberId, projectId) {
   } catch (e) { showToast('Could not delete'); }
 };
 
-/* ================= Render ================= */
+/* ================= Render (admin workspace) ================= */
 function render() {
   const ws = document.getElementById('weekSelect');
   if (ws.options.length !== weeks.length) {
@@ -400,7 +450,7 @@ function render() {
   renderOverview();
   renderTeam();
   if (document.getElementById('tab-projects') && document.getElementById('tab-projects').style.display !== 'none') renderProjectsAdmin();
-  if (document.getElementById('tab-myprojects') && document.getElementById('tab-myprojects').style.display !== 'none') renderMyProjects();
+  if (document.getElementById('tab-livetracking') && document.getElementById('tab-livetracking').style.display !== 'none') { populateLiveTrackProjectOptions(); renderLiveTracking(); }
 }
 
 function renderStats() {
@@ -434,7 +484,7 @@ function renderPeople() {
     const cap = memberCapacity(m);
     const hrs = memberHours(selectedWeek, m.id);
     const pct = cap > 0 ? Math.round(hrs / cap * 100) : 0;
-    const projects = filterActive
+    const projectsForMember = filterActive
       ? getProjects(selectedWeek, m.id).filter((p) => (p.project || '').trim().toLowerCase() === projectFilter.trim().toLowerCase())
       : getProjects(selectedWeek, m.id);
     return `
@@ -453,7 +503,7 @@ function renderPeople() {
         <div class="load-track"><div class="load-fill" style="width:${Math.min(pct, 100)}%;background:${loadColor(pct)}"></div>${pct >= 100 ? '<div class="load-tick"></div>' : ''}</div>
       </div>
       <ul class="projects">
-        ${projects.length ? projects.map((p) => {
+        ${projectsForMember.length ? projectsForMember.map((p) => {
           const dl = deadlineInfo(p.deadline);
           return `
           <li class="project">
@@ -499,16 +549,19 @@ function renderTeam() {
   document.getElementById('memberCount').textContent = data.members.length;
   const el = document.getElementById('teamList');
   el.innerHTML = data.members.length ? data.members.map((m) => `
-    <div class="ov-row" style="grid-template-columns:1fr auto auto;gap:18px;">
+    <div class="ov-row" style="grid-template-columns:1fr auto auto auto;gap:18px;">
       <div style="display:flex;align-items:center;gap:10px;">
         <div class="avatar">${initials(m.name)}</div>
         <span class="ov-name">${esc(m.name)}</span>
       </div>
-      <div class="cap-cell admin-only">
+      <div class="email-cell">
+        <input type="email" placeholder="email@adobe.com" value="${esc(m.email || '')}" onchange="setMemberEmail('${m.id}', this.value)">
+      </div>
+      <div class="cap-cell">
         Capacity
         <input type="number" min="1" step="1" value="${memberCapacity(m)}" onchange="setMemberCapacity('${m.id}', this.value)"> hrs/wk
       </div>
-      <span class="person-del admin-only" onclick="removeMember('${m.id}')">Remove</span>
+      <span class="person-del" onclick="removeMember('${m.id}')">Remove</span>
     </div>`).join('') : '<div class="empty">No members yet.</div>';
 }
 
@@ -557,8 +610,9 @@ function renderRollup() {
     : '<div class="empty">Nothing delivered yet.</div>';
 }
 window.renderRollup = renderRollup;
+window.renderLiveTracking = renderLiveTracking;
 
-/* ================= Import / Export ================= */
+/* ================= Import / Export (admin workspace) ================= */
 document.getElementById('importFile').addEventListener('change', function (e) {
   const file = e.target.files[0]; if (!file) return;
   const reader = new FileReader();
@@ -613,13 +667,7 @@ async function importRows(rows) {
     if (!weeks.includes(curWeek)) weeks.push(curWeek);
 
     let mid = nameToId[curMember.toLowerCase()];
-    if (!mid) {
-      if (!admin) { continue; } // only admins can create new members; skip row for unknown members
-      try {
-        const nm = await insertMember(curMember, data.capacity);
-        data.members.push(nm); nameToId[curMember.toLowerCase()] = nm.id; mid = nm.id;
-      } catch (e) { continue; }
-    }
+    if (!mid) { continue; } // Team tab now requires an email at creation time; import never creates new members.
     if (ci.capacity >= 0 && admin) {
       const capv = parseFloat(row[ci.capacity]);
       if (capv > 0) { const mm = data.members.find((x) => x.id === mid); if (mm && mm.capacity !== capv) { try { await updateMemberCapacity(mid, capv); mm.capacity = capv; } catch (e) {} } }
@@ -649,7 +697,7 @@ async function importRows(rows) {
   }
   weeks.sort((a, b) => new Date(a.slice(0, 11).replace(/-/g, ' ')) - new Date(b.slice(0, 11).replace(/-/g, ' ')));
   render();
-  showToast(`Imported ${added} project row(s)${admin ? '' : ' (new members skipped — admin only)'}`);
+  showToast(`Imported ${added} project row(s) (rows for members not already in Team were skipped)`);
 }
 
 window.exportExcel = function exportExcel() {
@@ -664,12 +712,12 @@ window.exportExcel = function exportExcel() {
   orderWeeks.forEach((w) => {
     data.members.forEach((m) => {
       const cap = memberCapacity(m);
-      const projects = getProjects(w, m.id);
+      const projectsForMember = getProjects(w, m.id);
       const hrs = memberHours(w, m.id);
       const pct = cap > 0 ? Math.round(hrs / cap * 100) + '%' : '';
-      const rowsForMember = Math.max(projects.length, 1);
+      const rowsForMember = Math.max(projectsForMember.length, 1);
       for (let i = 0; i < rowsForMember; i++) {
-        const p = projects[i]; const d = p && p.days ? p.days : {};
+        const p = projectsForMember[i]; const d = p && p.days ? p.days : {};
         aoa.push([
           i === 0 ? w : '', i === 0 ? m.name : '', p ? p.project : '', p && p.deadline ? p.deadline : '',
           p ? (Number(d.mon) || 0) : '', p ? (Number(d.tue) || 0) : '', p ? (Number(d.wed) || 0) : '', p ? (Number(d.thu) || 0) : '', p ? (Number(d.fri) || 0) : '',
@@ -686,7 +734,7 @@ window.exportExcel = function exportExcel() {
   XLSX.writeFile(wb, `POD_Weekly_Tracker_${new Date().toISOString().slice(0, 10)}.xlsx`);
 };
 
-/* ================= Branding (admin only) ================= */
+/* ================= Branding (admin only to edit; both workspaces display it) ================= */
 const DEFAULT_MARK_SVG = '<svg viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><circle cx="20" cy="20" r="14.5" fill="none" stroke="currentColor" stroke-width="3.2"/><path d="M16.5 13.5 L16.5 26.5 L27 20 Z" fill="currentColor"/></svg>';
 function applyLogo() {
   const mark = document.getElementById('brandMark');
@@ -752,10 +800,237 @@ function setupRename() {
   tel.addEventListener('blur', commitTagline);
 }
 
+/* ============================================================
+   ================= MEMBER WORKSPACE (NEW) ===================
+   ============================================================
+   Strictly isolated from the admin workspace: never calls fetchBoard()
+   (which is admin-scoped by RLS), only ever touches `projects` /
+   `project_assignments` / `time_logs` rows the signed-in user is allowed
+   to see, per the RLS policies in supabase/schema_update.sql. */
+
+let memberProjects = []; // projects assigned to this member (already RLS-scoped)
+let myTimeLogs = [];     // this member's own time log rows
+
+const timerState = {
+  running: false,
+  projectId: null,
+  projectName: '',
+  firstStart: null,       // ISO timestamp of when the timer was first started (for this session)
+  segmentStart: null,     // Date when the current running segment began (null while paused)
+  accumulatedSeconds: 0,  // seconds banked from previous segments (before the current running one)
+  intervalId: null,
+};
+
+function elapsedTimerSeconds() {
+  const running = timerState.segmentStart ? (Date.now() - timerState.segmentStart.getTime()) / 1000 : 0;
+  return timerState.accumulatedSeconds + running;
+}
+function formatClock(totalSeconds) {
+  const s = Math.max(0, Math.floor(totalSeconds));
+  const hh = pad(Math.floor(s / 3600));
+  const mm = pad(Math.floor((s % 3600) / 60));
+  const ss = pad(s % 60);
+  return `${hh}:${mm}:${ss}`;
+}
+function tickTimerDisplay() {
+  const el = document.getElementById('timerDisplay');
+  if (el) el.textContent = formatClock(elapsedTimerSeconds());
+}
+
+window.startTimer = function startTimer() {
+  const sel = document.getElementById('timerProjectSelect');
+  if (!sel || !sel.value) { showToast('Choose a project first'); return; }
+  timerState.running = true;
+  timerState.projectId = sel.value;
+  timerState.projectName = sel.options[sel.selectedIndex]?.text || '';
+  timerState.firstStart = new Date().toISOString();
+  timerState.accumulatedSeconds = 0;
+  timerState.segmentStart = new Date();
+  timerState.intervalId = setInterval(tickTimerDisplay, 1000);
+  tickTimerDisplay();
+  sel.disabled = true;
+  document.getElementById('timerStartBtn').style.display = 'none';
+  document.getElementById('timerPauseBtn').style.display = '';
+  document.getElementById('timerResumeBtn').style.display = 'none';
+  document.getElementById('timerStopBtn').style.display = '';
+};
+window.pauseTimer = function pauseTimer() {
+  if (!timerState.segmentStart) return;
+  timerState.accumulatedSeconds += (Date.now() - timerState.segmentStart.getTime()) / 1000;
+  timerState.segmentStart = null;
+  timerState.running = false;
+  clearInterval(timerState.intervalId); timerState.intervalId = null;
+  tickTimerDisplay();
+  document.getElementById('timerPauseBtn').style.display = 'none';
+  document.getElementById('timerResumeBtn').style.display = '';
+};
+window.resumeTimer = function resumeTimer() {
+  timerState.segmentStart = new Date();
+  timerState.running = true;
+  timerState.intervalId = setInterval(tickTimerDisplay, 1000);
+  document.getElementById('timerPauseBtn').style.display = '';
+  document.getElementById('timerResumeBtn').style.display = 'none';
+};
+window.stopTimer = async function stopTimer() {
+  const totalSeconds = elapsedTimerSeconds();
+  clearInterval(timerState.intervalId); timerState.intervalId = null;
+  const session = getSession();
+  if (session && timerState.projectId && totalSeconds >= 1) {
+    try {
+      await insertTimeLog({
+        userId: session.user.id,
+        projectId: timerState.projectId,
+        durationSeconds: totalSeconds,
+        startTime: timerState.firstStart,
+        endTime: new Date().toISOString(),
+        notes: null,
+        isManual: false,
+      });
+      showToast(`Saved ${formatDuration(totalSeconds)} on ${timerState.projectName}`);
+    } catch (e) { showToast('Could not save your time — check your connection'); }
+  }
+  timerState.running = false; timerState.projectId = null; timerState.projectName = '';
+  timerState.firstStart = null; timerState.segmentStart = null; timerState.accumulatedSeconds = 0;
+  const sel = document.getElementById('timerProjectSelect');
+  if (sel) sel.disabled = false;
+  const disp = document.getElementById('timerDisplay'); if (disp) disp.textContent = '00:00:00';
+  document.getElementById('timerStartBtn').style.display = '';
+  document.getElementById('timerPauseBtn').style.display = 'none';
+  document.getElementById('timerResumeBtn').style.display = 'none';
+  document.getElementById('timerStopBtn').style.display = 'none';
+  await loadMemberWorkspaceData();
+  renderMemberWorkspace();
+};
+
+window.submitManualEntry = async function submitManualEntry() {
+  const sel = document.getElementById('manualProjectSelect');
+  const dateEl = document.getElementById('manualDate');
+  const hrsEl = document.getElementById('manualHours');
+  const minsEl = document.getElementById('manualMinutes');
+  const notesEl = document.getElementById('manualNotes');
+  if (!sel || !sel.value) { showToast('Choose a project'); return; }
+  const hours = parseInt(hrsEl.value, 10) || 0;
+  const minutes = parseInt(minsEl.value, 10) || 0;
+  const durationSeconds = hours * 3600 + minutes * 60;
+  if (durationSeconds <= 0) { showToast('Enter hours and/or minutes'); return; }
+  const dateVal = dateEl.value || new Date().toISOString().slice(0, 10);
+  const session = getSession();
+  if (!session) return;
+  try {
+    await insertTimeLog({
+      userId: session.user.id,
+      projectId: sel.value,
+      durationSeconds,
+      startTime: `${dateVal}T12:00:00`,
+      endTime: null,
+      notes: notesEl.value.trim() || null,
+      isManual: true,
+    });
+    hrsEl.value = ''; minsEl.value = ''; notesEl.value = '';
+    showToast('Time logged');
+    await loadMemberWorkspaceData();
+    renderMemberWorkspace();
+  } catch (e) { showToast('Could not save — check your connection'); }
+};
+
+window.editTimeLogNotes = async function editTimeLogNotes(id) {
+  const log = myTimeLogs.find((l) => l.id === id); if (!log) return;
+  const next = window.prompt('Edit notes for this time entry:', log.notes || '');
+  if (next === null) return;
+  try {
+    await updateTimeLog(id, { notes: next.trim() || null });
+    log.notes = next.trim();
+    renderMemberLogsList();
+    showToast('Notes updated');
+  } catch (e) { showToast('Could not update this entry'); }
+};
+
+function populateMemberProjectSelects() {
+  const options = memberProjects.length
+    ? memberProjects.map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join('')
+    : '<option value="">No projects assigned</option>';
+  ['timerProjectSelect', 'manualProjectSelect'].forEach((id) => {
+    const sel = document.getElementById(id);
+    if (!sel) return;
+    const prev = sel.value;
+    sel.innerHTML = options;
+    if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+  });
+  const dateEl = document.getElementById('manualDate');
+  if (dateEl && !dateEl.value) dateEl.value = new Date().toISOString().slice(0, 10);
+}
+
+function renderMemberStats() {
+  const el = document.getElementById('memberStatStrip');
+  if (!el) return;
+  const now = new Date();
+  const day = now.getDay();
+  const mon = new Date(now); mon.setDate(now.getDate() + (day === 0 ? -6 : 1 - day)); mon.setHours(0, 0, 0, 0);
+  const weekSeconds = myTimeLogs.filter((l) => new Date(l.startTime) >= mon).reduce((s, l) => s + l.duration, 0);
+  const totalSeconds = myTimeLogs.reduce((s, l) => s + l.duration, 0);
+  el.innerHTML = `
+    <div class="stat"><div class="label">This week</div><div class="value teal">${formatDuration(weekSeconds)}</div></div>
+    <div class="stat"><div class="label">All-time logged</div><div class="value accent">${formatDuration(totalSeconds)}</div></div>
+    <div class="stat"><div class="label">Assigned projects</div><div class="value">${memberProjects.length}</div></div>
+    <div class="stat"><div class="label">Total entries</div><div class="value">${myTimeLogs.length}</div></div>
+  `;
+}
+
+function renderMemberProjectsList() {
+  const el = document.getElementById('memberProjectsList');
+  if (!el) return;
+  if (!myMemberId) {
+    el.innerHTML = '<div class="empty">Your login isn\'t linked to a team member yet. Ask your admin to add your email in the Team tab.</div>';
+    return;
+  }
+  if (!memberProjects.length) { el.innerHTML = '<div class="empty">No projects assigned to you yet.</div>'; return; }
+  el.innerHTML = memberProjects.map((p) => {
+    const secs = myTimeLogs.filter((l) => l.projectId === p.id).reduce((s, l) => s + l.duration, 0);
+    return `
+    <div class="proj-item">
+      <div>
+        <div class="pname">${esc(p.name)}</div>
+        <div class="pmeta">Status: ${esc(p.status.replace('_', ' '))} · ${formatDuration(secs)} logged total</div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function renderMemberLogsList() {
+  const el = document.getElementById('memberLogsList');
+  if (!el) return;
+  if (!myTimeLogs.length) { el.innerHTML = '<div class="empty">No time logged yet — start the timer or log time manually above.</div>'; return; }
+  const nameFor = (id) => (memberProjects.find((p) => p.id === id)?.name) || 'Unknown project';
+  el.innerHTML = myTimeLogs.slice(0, 30).map((l) => `
+    <div class="log-item">
+      <div>
+        <div class="lname">${esc(nameFor(l.projectId))}</div>
+        <div class="lmeta">${formatLogDate(l.startTime)}${l.notes ? ' · ' + esc(l.notes) : ''}<span class="log-tag">${l.isManual ? 'manual' : 'timer'}</span><span class="log-edit" onclick="editTimeLogNotes('${l.id}')">Edit notes</span></div>
+      </div>
+      <div class="lhrs">${formatDuration(l.duration)}</div>
+    </div>`).join('');
+}
+
+function renderMemberWorkspace() {
+  populateMemberProjectSelects();
+  renderMemberStats();
+  renderMemberProjectsList();
+  renderMemberLogsList();
+}
+
+async function loadMemberWorkspaceData() {
+  const session = getSession();
+  myMemberId = session ? await getMemberIdForAuthUser(session.user.id) : null;
+  try { memberProjects = await fetchProjects(); } catch (e) { memberProjects = []; }
+  try {
+    myTimeLogs = session ? await fetchTimeLogs({ userId: session.user.id }) : [];
+  } catch (e) { myTimeLogs = []; }
+}
+
 /* ================= Init (after auth) ================= */
 let initialized = false;
-async function initApp() {
-  if (unsubscribeRealtime) unsubscribeRealtime();
+
+async function initAdminWorkspace() {
   buildWeeks();
   await loadData();
   const cur = currentWeekLabel();
@@ -766,6 +1041,21 @@ async function initApp() {
   setupLogo();
   buildPeriodOptions();
   render();
+}
+
+async function initMemberWorkspace() {
+  // Branding only — never touches the admin-scoped `members`/`assignments` tables.
+  try { data = { ...data, ...(await fetchAppSettingsOnly()) }; } catch (e) { /* keep defaults */ }
+  applyAppName();
+  applyLogo();
+  await loadMemberWorkspaceData();
+  renderMemberWorkspace();
+}
+
+async function initApp() {
+  if (unsubscribeRealtime) unsubscribeRealtime();
+  if (isAdmin()) await initAdminWorkspace();
+  else await initMemberWorkspace();
   unsubscribeRealtime = subscribeToBoard(reload);
   initialized = true;
 }
@@ -774,6 +1064,7 @@ initAuth({
   onAuthed: () => { initApp(); },
   onSignedOut: () => {
     if (unsubscribeRealtime) { unsubscribeRealtime(); unsubscribeRealtime = null; }
+    if (timerState.intervalId) { clearInterval(timerState.intervalId); timerState.intervalId = null; }
     initialized = false;
   },
 });
