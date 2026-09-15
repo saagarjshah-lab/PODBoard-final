@@ -222,3 +222,73 @@ body.role-member .admin-only{display:none !important;}
 .new-project-form input[type=text]{flex:1;min-width:180px;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:9px 12px;font-size:13px;font-family:inherit;}
 .project-del-sm{color:var(--text-dim);cursor:pointer;font-size:12px;}
 .project-del-sm:hover{color:var(--danger);}
+
+/* ================= Strict workspace isolation (added) ================= */
+body:not(.role-member) .member-only{display:none !important;}
+body:not(.is-super-admin) .super-admin-only{display:none !important;}
+
+/* ================= Account roles panel (Phase 1 RBAC, added) ================= */
+.role-panel-hint{color:var(--text-muted);font-size:12px;margin:-4px 0 14px;}
+.role-row{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--border);gap:14px;flex-wrap:wrap;}
+.role-row:last-child{border-bottom:none;}
+.role-row .role-email{font-size:13px;color:var(--text);}
+.role-tag-super{font-family:'IBM Plex Mono';font-size:10.5px;text-transform:uppercase;letter-spacing:.6px;background:rgba(217,168,79,.18);color:var(--accent);border:1px solid var(--accent);border-radius:20px;padding:3px 10px;}
+
+/* ================= Project timeline dates (Phase 3, added) ================= */
+.project-date-row{display:flex;gap:18px;flex-wrap:wrap;margin-top:12px;padding-top:12px;border-top:1px solid var(--border);}
+.project-date-row label{display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--text-muted);}
+.project-date-row input[type=date]{background:var(--surface3);border:1px solid var(--border);color:var(--text);border-radius:7px;padding:6px 9px;font-size:12px;font-family:inherit;}
+
+/* ================= Dual export engine (Phase 3, added) ================= */
+.report-export-row{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;padding:13px 0;border-bottom:1px solid var(--border);}
+.report-export-row:last-child{border-bottom:none;}
+.report-export-label{font-weight:600;font-size:13.5px;}
+.report-export-desc{font-size:11.5px;color:var(--text-muted);margin-top:2px;}
+.report-export-buttons{display:flex;gap:8px;flex-shrink:0;}
+
+/* ================= Project timeline chart (Phase 3, added) ================= */
+.timeline-window-label{font-family:'IBM Plex Mono';font-size:11px;color:var(--text-dim);margin-bottom:16px;}
+.timeline-row{margin-bottom:16px;}
+.timeline-row:last-child{margin-bottom:0;}
+.timeline-row-label{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;gap:10px;flex-wrap:wrap;}
+.timeline-proj-name{font-weight:600;font-size:13px;}
+.timeline-contributors{font-size:11px;color:var(--text-muted);}
+.timeline-track{position:relative;height:20px;background:var(--surface2);border-radius:6px;border:1px solid var(--border);}
+.timeline-bar{position:absolute;top:2px;bottom:2px;border-radius:5px;background:var(--blue);min-width:6px;}
+.timeline-bar.ongoing{background:var(--teal);}
+.timeline-bar.on_hold{background:var(--accent);}
+.timeline-bar.completed{background:var(--surface3);}
+.timeline-today-mark{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--danger);}
+
+/* ================= Two-factor authentication (Phase 4, added) ================= */
+.mfa-qr{display:block;width:180px;height:180px;margin:16px auto;border-radius:8px;background:#fff;padding:8px;}
+.mfa-secret{font-family:'IBM Plex Mono';font-size:11.5px;color:var(--text-muted);text-align:center;word-break:break-all;margin-bottom:6px;}
+.add-member{flex-wrap:wrap;}
+.add-member input[type=email]{max-width:220px;}
+
+/* ================= Member workspace: live timer (added) ================= */
+.timer-widget{display:flex;align-items:center;gap:18px;flex-wrap:wrap;margin-top:8px;}
+.timer-display{font-family:'IBM Plex Mono';font-size:30px;font-weight:600;color:var(--accent);letter-spacing:1px;min-width:140px;}
+.timer-controls{display:flex;gap:8px;flex-wrap:wrap;}
+
+/* ================= Member workspace: manual time entry (added) ================= */
+.manual-entry-form{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px;}
+.manual-entry-form input[type=date],
+.manual-entry-form input[type=number]{background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:9px 11px;font-size:13px;font-family:inherit;}
+.manual-entry-form input[type=number]{width:88px;}
+.manual-entry-form input[type=text]{flex:1;min-width:160px;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:9px 12px;font-size:13px;font-family:inherit;}
+
+/* ================= Time log list rows (added, reuses .proj-item pattern) ================= */
+.log-item{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:11px 0;border-bottom:1px solid var(--border);}
+.log-item:last-child{border-bottom:none;}
+.log-item .lname{font-weight:600;font-size:13.5px;}
+.log-item .lmeta{font-size:11px;color:var(--text-muted);margin-top:3px;}
+.log-item .lhrs{font-family:'IBM Plex Mono';font-size:12px;color:var(--text);white-space:nowrap;text-align:right;}
+.log-tag{font-size:10px;text-transform:uppercase;letter-spacing:.5px;padding:2px 7px;border-radius:20px;background:var(--surface3);color:var(--text-dim);margin-left:6px;}
+.log-edit{color:var(--text-dim);cursor:pointer;font-size:11px;margin-left:8px;}
+.log-edit:hover{color:var(--accent);}
+
+/* ================= Live tracking (admin, added) ================= */
+.livetrack-member-row{display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid var(--border);font-size:13px;}
+.livetrack-member-row:last-child{border-bottom:none;}
+.livetrack-member-row .lt-hours{font-family:'IBM Plex Mono';font-size:12.5px;color:var(--teal);}

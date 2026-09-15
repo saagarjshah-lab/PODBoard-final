@@ -1,5 +1,145 @@
 # POD Board — Weekly Capacity Tracker (production)
 
+## Phase 4 of the enterprise upgrade: Auth hardening (final phase)
+Builds on Phases 1–3. Two additions to the login screen and account security:
+
+- **Password reset**: "Forgot password?" link on the login screen calls
+  `supabase.auth.resetPasswordForEmail()`. Clicking the emailed link lands
+  the user back on the app in a dedicated "Set a new password" screen
+  (detected via the `PASSWORD_RECOVERY` auth event) — they set a new
+  password via `supabase.auth.updateUser()`, then flow straight into the
+  app (or into the MFA challenge below, if they have 2FA enabled).
+- **Optional 2FA (TOTP)**: a new "Security" button in the header (available
+  to every signed-in user, any tier) opens a modal to enroll via
+  `supabase.auth.mfa.enroll()` — scan the QR code, confirm a 6-digit code,
+  done. Once enrolled, every future password sign-in stops at a dedicated
+  MFA challenge screen before the app loads, checked via
+  `supabase.auth.mfa.getAuthenticatorAssuranceLevel()`. Users can disable
+  it again from the same modal.
+
+No schema changes this phase — Supabase's built-in `auth.mfa_factors`
+table handles TOTP enrollment entirely; nothing to add to `schema_update.sql`.
+
+**One setting to check in Supabase**: Authentication → Providers → Email
+must have "Enable password recovery" (rate limits aside, this is on by
+default). Authentication → MFA must have TOTP enabled as a factor type
+(also on by default on current Supabase projects).
+
+---
+
+## Phase 3 of the enterprise upgrade: Reporting
+Builds on Phase 1 (RBAC) and Phase 2 (Executive Roll-Up). Three additions,
+all admin-tier (visible to Admin/Boss and Super Admin alike):
+
+- **Dual Excel export engine** (`src/lib/exportUtils.js`, buttons in the
+  Executive Roll-Up tab): **Per Team Member** (.xlsx/.csv) — weekly board
+  breakdown plus a full time-log sheet — and **Per Project** (.xlsx/.csv) —
+  contributors, hours burned (from both the legacy weekly board *and* the
+  new timer/manual `time_logs`), deadlines, and milestone completion.
+- **Project Timeline** (new "Timeline & History" tab): a lightweight CSS
+  Gantt-style view of ongoing/on-hold projects, contributors, and today's
+  position on the calendar. Projects without explicit start/target dates
+  fall back to inferring a range from the legacy weekly-board records that
+  match their name.
+- **Audit trail**: every project create/status-change/date-change/delete,
+  every staffing assign/unassign, and every role change now writes an
+  immutable `audit_logs` row. Surfaced as **Project History** (pick a
+  project) and **Member Work History** (pick a member) in the same tab.
+
+**Run `supabase/schema_update.sql`** — adds `projects.start_date` /
+`target_date` / `completed_at`, and the new `audit_logs` table (admin-tier
+read/write only, no update/delete policy at all — audit entries are
+permanent once written, even for Super Admin).
+
+---
+
+## Phase 2 of the enterprise upgrade: Executive Roll-Up dashboard
+Builds on Phase 1's 3-tier RBAC. New **Executive Roll-Up** tab, visible to
+both Admin/Boss and Super Admin (same tier as the rest of the Admin
+Workspace — nothing here is super-admin-exclusive):
+
+- **KPIs**: Headcount, Capacity vs. Allocated for the selected period,
+  Utilization %, Billable vs. Internal hours.
+- **Project status breakdown**: Ongoing / On hold / Completed counts.
+- **Resource availability & forecasting table**: one row per member —
+  Capacity, Allocated, Availability (Capacity − Allocated), a status badge,
+  and a forecasted free date. Toggle **Daily / Weekly / Monthly / Quarterly**
+  to change the period.
+
+**Two judgment calls worth knowing about** (the spec didn't fully pin these down):
+- **Billable vs Internal** is now a per-project flag (new `projects.billable`
+  column, editable in the Projects tab). An hour logged against a free-text
+  project name that doesn't match any formal `projects` entity defaults to
+  **Billable** — so untracked legacy work isn't silently undercounted.
+- The **Free/Bench (<20h) · Optimal (20–40h) · Overallocated (>40h)** bands
+  are calibrated to a standard 40-hour week. To stay meaningful in the Daily/
+  Monthly/Quarterly views, each member's allocation is converted to a
+  "weekly-equivalent" number first (today's hours × 5 for Daily; period
+  total ÷ weeks-in-period for Monthly/Quarterly) before picking the badge.
+
+**Run `supabase/schema_update.sql`** — this phase only needs one column:
+`projects.billable boolean default true`. Everything else (KPIs, forecasting)
+is computed client-side from tables that already exist.
+
+---
+
+## Phase 1 of the enterprise upgrade: 3-tier RBAC foundation
+This is phase 1 of a multi-phase enterprise upgrade (Executive Roll-Up
+dashboard, dual export engine, timelines/audit log, and 2FA/password reset
+are planned for later phases — not in this drop).
+
+**New role model**: `profiles.role` is now `super_admin` | `admin` | `member`.
+- **Super Admin** — fixed to `sashah@adobe.com` (also enforced at the DB
+  level in `is_super_admin()`, so it can't be revoked by editing the row).
+  Can promote/demote other accounts between Admin and Member (Team tab →
+  "Account roles"), and is the only one who can edit global settings: app
+  name, tagline, logo, default weekly capacity.
+- **Admin / Boss** — everything the old single "admin" tier could do:
+  Week Board, Capacity Overview, Rollup, Team (add/remove members, set
+  capacity/email), Projects (create + staff), Live Tracking. Cannot assign
+  roles or touch branding/capacity — those controls are now hidden for
+  this tier, not just rejected server-side.
+- **Member** — unchanged: their own Member Workspace only.
+
+**Run `supabase/schema_update.sql`** — idempotent, self-contained. Widens
+the `profiles.role` check constraint, redefines `is_admin()` to mean
+"admin-tier or higher" (so every existing policy that already calls it
+keeps working unchanged), adds `is_super_admin()`, tightens `profiles`
+and `app_settings` policies, and seeds `sashah@adobe.com` as `super_admin`.
+
+---
+
+## Strict Admin/Member workspace isolation (latest upgrade)
+This version splits the app into two fully separate workspaces, gated by role:
+
+- **Admin Workspace** (`sashah@adobe.com`, or any `profiles.role = 'admin'`):
+  everything from before (Week Board, Capacity Overview, Rollup, Team, Projects)
+  plus a new **Live Tracking** tab — pick an ongoing project from a dropdown and
+  see who's assigned, cumulative time logged per person, and recent entries.
+- **Member Workspace** (everyone else): a completely separate view. Members
+  never see the admin tabs, other members' data, or unassigned projects. They get:
+  - **My projects** — only the projects an admin staffed them on.
+  - **Live timer** — Start/Pause/Resume/Stop against a chosen project; Stop
+    saves a `time_logs` row.
+  - **Manual time entry** — date + hours/minutes + notes for past work.
+  - **Personal summary** — their own this-week and all-time hours only.
+
+**Run `supabase/schema_update.sql`** — it's a fresh, fully self-contained,
+idempotent script that adds `time_logs`, tightens RLS on `members`/`assignments`/
+`projects`/`project_assignments` to the strict model described in its header
+comments, and re-seeds `sashah@adobe.com` as admin. Safe to run whether or not
+earlier versions of this file were already applied.
+
+**Team tab change**: adding a member now requires an `@adobe.com` email
+up front (previously optional) — it's what lets that person's login link to
+their member record and see their own workspace.
+
+**Note on the timer**: it runs in-memory only; refreshing the page or closing
+the tab while it's running discards unsaved time. Click "Stop & save" before
+navigating away.
+
+---
+
 Vanilla JS + Vite frontend, Supabase for auth/data/realtime, deployed as a static
 site on Render. Feature-for-feature port of the original HTML mock: week board,
 capacity overview, monthly/quarterly rollup, team management, Excel import/export,

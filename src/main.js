@@ -1,19 +1,24 @@
 import * as XLSX from 'xlsx';
-import { initAuth, isAdmin, getSession } from './lib/auth.js';
+import { initAuth, isAdmin, isSuperAdmin, getSession, mfaListFactors, mfaEnrollTotp, mfaVerifyCode, mfaUnenroll } from './lib/auth.js';
+import { ALLOWED_DOMAIN } from './lib/supabaseClient.js';
 import {
-  fetchBoard, updateAppSettings, insertMember, updateMemberCapacity, deleteMember,
+  fetchBoard, fetchAppSettingsOnly, updateAppSettings, insertMember, updateMemberCapacity, updateMemberEmail, deleteMember,
   upsertAssignment, deleteAssignment, subscribeToBoard,
-  fetchProjects, insertProject, updateProjectStatus, deleteProjectRow,
+  fetchProjects, insertProject, updateProjectStatus, updateProjectBillable, updateProjectDates, deleteProjectRow,
   assignMemberToProject, unassignMemberFromProject, getMemberIdForAuthUser,
+  fetchTimeLogs, insertTimeLog, updateTimeLog,
+  fetchAllProfiles, updateProfileRole,
+  fetchAuditLogs,
 } from './lib/db.js';
+import { exportPerMemberReport, exportPerProjectReport } from './lib/exportUtils.js';
 
-/* ================= State ================= */
+/* ================= State (admin workspace) ================= */
 let data = { appName: 'POD Board', tagline: 'Weekly Capacity Tracker', capacity: 40, members: [], assignments: {} };
 let weeks = [];
 let selectedWeek = null;
 let editCtx = null; // {memberId, projectId|null}
 let unsubscribeRealtime = null;
-let projects = []; // [{id,name,description,status,memberIds}]
+let projects = []; // [{id,name,description,status,memberIds}] — RLS-scoped: all for admin, assigned-only for members
 let projectFilter = ''; // '' = all projects; else a project name (admin ongoing-projects dropdown)
 let myMemberId = null; // members.id linked to the current auth user, if any
 
@@ -89,19 +94,18 @@ function currentWeekLabel() {
   return weekLabel(mon);
 }
 
-/* ================= Data load (Supabase) ================= */
+/* ================= Data load (Supabase) — admin workspace ================= */
 async function loadData() {
   data = await fetchBoard();
   Object.keys(data.assignments).forEach((w) => { if (!weeks.includes(w)) weeks.push(w); });
   try { projects = await fetchProjects(); } catch (e) { projects = []; }
-  try {
-    const session = getSession();
-    myMemberId = session ? await getMemberIdForAuthUser(session.user.id) : null;
-  } catch (e) { myMemberId = null; }
 }
-async function reload() { await loadData(); render(); }
+async function reload() {
+  if (isAdmin()) { await loadData(); render(); }
+  else { await loadMemberWorkspaceData(); renderMemberWorkspace(); }
+}
 
-/* ================= Helpers ================= */
+/* ================= Helpers (shared) ================= */
 function showToast(m) { const t = document.getElementById('toast'); t.textContent = m; t.classList.add('show'); setTimeout(() => t.classList.remove('show'), 1800); }
 function initials(name) { return name.trim().split(/\s+/).map((w) => w[0]).slice(0, 2).join('').toUpperCase(); }
 function getProjects(week, memberId) { return (data.assignments[week] && data.assignments[week][memberId]) || []; }
@@ -135,17 +139,32 @@ function utilFlag(pct) {
   if (pct >= 70) return '<span class="flag flag-ok">Healthy</span>';
   return '<span class="flag flag-free">Has availability</span>';
 }
+function formatDuration(seconds) {
+  const s = Math.max(0, Math.round(seconds || 0));
+  const h = Math.floor(s / 3600), m = Math.round((s % 3600) / 60);
+  if (h && m) return `${h}h ${m}m`;
+  if (h) return `${h}h`;
+  return `${m}m`;
+}
+function formatLogDate(iso) {
+  if (!iso) return '';
+  const d = new Date(iso); if (isNaN(d)) return '';
+  return `${pad(d.getDate())} ${MONTHS[d.getMonth()]} ${d.getFullYear()}`;
+}
 
-/* ================= Tabs / controls ================= */
+/* ================= Tabs / controls (admin workspace) ================= */
 window.switchTab = function switchTab(tab) {
   document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === tab));
-  ['board', 'overview', 'rollup', 'team', 'projects', 'myprojects'].forEach((t) => {
+  ['board', 'overview', 'rollup', 'team', 'projects', 'livetracking', 'exec', 'timeline'].forEach((t) => {
     const el = document.getElementById('tab-' + t);
     if (el) el.style.display = t === tab ? 'block' : 'none';
   });
   if (tab === 'rollup') renderRollup();
+  if (tab === 'team') renderRoleManagement();
   if (tab === 'projects') renderProjectsAdmin();
-  if (tab === 'myprojects') renderMyProjects();
+  if (tab === 'livetracking') { populateLiveTrackProjectOptions(); renderLiveTracking(); }
+  if (tab === 'exec') { refreshExecControls(); renderExecutiveDashboard(); }
+  if (tab === 'timeline') { renderTimelineChart(); populateHistorySelectors(); renderProjectHistory(); renderMemberHistory(); }
 };
 window.setScope = function setScope(scope) {
   rollupScope = scope;
@@ -171,16 +190,28 @@ window.onCapacityChange = async function onCapacityChange() {
   render();
 };
 
-/* ================= Members ================= */
+/* ================= Members (admin workspace) ================= */
 window.addMember = async function addMember() {
   const el = document.getElementById('newMemberName');
+  const emailEl = document.getElementById('newMemberEmail');
   const name = el.value.trim();
+  const email = (emailEl?.value || '').trim().toLowerCase();
   if (!name) { showToast('Enter a name'); return; }
+  if (!email || !email.endsWith(ALLOWED_DOMAIN)) { showToast(`A valid ${ALLOWED_DOMAIN} email is required`); return; }
   try {
-    const m = await insertMember(name, data.capacity);
+    const m = await insertMember(name, data.capacity, email);
     data.members.push(m);
-    el.value = ''; render(); showToast('Member added');
-  } catch (e) { showToast('Only admins can add members'); }
+    el.value = ''; if (emailEl) emailEl.value = '';
+    render(); showToast('Member added');
+  } catch (e) { showToast(/duplicate|unique/i.test(e?.message || '') ? 'That email is already in use' : 'Only admins can add members'); }
+};
+window.setMemberEmail = async function setMemberEmail(id, val) {
+  const email = (val || '').trim().toLowerCase();
+  if (email && !email.endsWith(ALLOWED_DOMAIN)) { showToast(`Email must end with ${ALLOWED_DOMAIN}`); render(); return; }
+  const m = data.members.find((x) => x.id === id); if (!m) return;
+  try { await updateMemberEmail(id, email); m.email = email; showToast(email ? 'Email saved — they can now sign in and see their projects' : 'Email cleared'); }
+  catch (e) { showToast('Only admins can edit member email'); }
+  render();
 };
 window.setMemberCapacity = async function setMemberCapacity(id, val) {
   const m = data.members.find((x) => x.id === id); if (!m) return;
@@ -223,12 +254,13 @@ function populateProjectFilterOptions() {
 window.addProject = async function addProject() {
   const nameEl = document.getElementById('newProjectName');
   const statusEl = document.getElementById('newProjectStatus');
+  const billableEl = document.getElementById('newProjectBillable');
   const name = nameEl.value.trim();
   if (!name) { showToast('Enter a project name'); return; }
   try {
-    const p = await insertProject({ name, status: statusEl.value });
+    const p = await insertProject({ name, status: statusEl.value, billable: billableEl.value !== 'false' });
     projects.push(p);
-    nameEl.value = ''; statusEl.value = 'ongoing';
+    nameEl.value = ''; statusEl.value = 'ongoing'; billableEl.value = 'true';
     renderProjectsAdmin(); populateProjectFilterOptions();
     showToast('Project added');
   } catch (e) { showToast('Only admins can add projects'); }
@@ -236,15 +268,38 @@ window.addProject = async function addProject() {
 
 window.setProjectStatus = async function setProjectStatus(id, status) {
   const p = projects.find((x) => x.id === id); if (!p) return;
-  try { await updateProjectStatus(id, status); p.status = status; renderProjectsAdmin(); populateProjectFilterOptions(); }
-  catch (e) { showToast('Only admins can change project status'); renderProjectsAdmin(); }
+  const previousStatus = p.status;
+  try {
+    const completedAt = await updateProjectStatus(id, status, { previousStatus, projectName: p.name });
+    p.status = status; p.completedAt = completedAt || '';
+    renderProjectsAdmin(); populateProjectFilterOptions();
+  } catch (e) { showToast('Only admins can change project status'); renderProjectsAdmin(); }
+};
+
+window.setProjectBillable = async function setProjectBillable(id, val) {
+  const p = projects.find((x) => x.id === id); if (!p) return;
+  const billable = val !== 'false';
+  try { await updateProjectBillable(id, billable); p.billable = billable; }
+  catch (e) { showToast('Only admins can change billing classification'); renderProjectsAdmin(); }
+};
+
+window.setProjectDates = async function setProjectDates(id, field, val) {
+  const p = projects.find((x) => x.id === id); if (!p) return;
+  const startDate = field === 'start' ? val : (p.startDate || '');
+  const targetDate = field === 'target' ? val : (p.targetDate || '');
+  try {
+    await updateProjectDates(id, { startDate, targetDate }, { projectName: p.name });
+    p.startDate = startDate; p.targetDate = targetDate;
+    showToast('Timeline dates updated');
+  } catch (e) { showToast('Only admins can change project dates'); renderProjectsAdmin(); }
 };
 
 window.deleteProjectAdmin = async function deleteProjectAdmin(id) {
+  const p = projects.find((x) => x.id === id); if (!p) return;
   if (!confirm('Delete this project and its member assignments?')) return;
   try {
-    await deleteProjectRow(id);
-    projects = projects.filter((p) => p.id !== id);
+    await deleteProjectRow(id, { projectName: p.name });
+    projects = projects.filter((x) => x.id !== id);
     renderProjectsAdmin(); populateProjectFilterOptions();
     showToast('Project deleted');
   } catch (e) { showToast('Only admins can delete projects'); }
@@ -252,10 +307,11 @@ window.deleteProjectAdmin = async function deleteProjectAdmin(id) {
 
 window.toggleProjectMember = async function toggleProjectMember(projectId, memberId) {
   const p = projects.find((x) => x.id === projectId); if (!p) return;
+  const m = data.members.find((x) => x.id === memberId);
   const assigned = p.memberIds.includes(memberId);
   try {
-    if (assigned) { await unassignMemberFromProject(projectId, memberId); p.memberIds = p.memberIds.filter((id) => id !== memberId); }
-    else { await assignMemberToProject(projectId, memberId); p.memberIds.push(memberId); }
+    if (assigned) { await unassignMemberFromProject(projectId, memberId, { projectName: p.name, memberName: m?.name }); p.memberIds = p.memberIds.filter((id) => id !== memberId); }
+    else { await assignMemberToProject(projectId, memberId, { projectName: p.name, memberName: m?.name }); p.memberIds.push(memberId); }
     renderProjectsAdmin();
   } catch (e) { showToast('Only admins can change project staffing'); }
 };
@@ -270,9 +326,13 @@ function renderProjectsAdmin() {
       <div class="project-admin-top">
         <div>
           <div class="project-admin-name">${esc(p.name)}</div>
-          <div class="project-admin-desc">${p.memberIds.length} member${p.memberIds.length === 1 ? '' : 's'} assigned</div>
+          <div class="project-admin-desc">${p.memberIds.length} member${p.memberIds.length === 1 ? '' : 's'} assigned${p.completedAt ? ' · completed ' + fmtDMY(new Date(p.completedAt)) : ''}</div>
         </div>
         <div style="display:flex;align-items:center;gap:10px;">
+          <select class="mini-select" onchange="setProjectBillable('${p.id}', this.value)">
+            <option value="true" ${p.billable !== false ? 'selected' : ''}>Billable</option>
+            <option value="false" ${p.billable === false ? 'selected' : ''}>Internal</option>
+          </select>
           <select class="mini-select" onchange="setProjectStatus('${p.id}', this.value)">
             <option value="ongoing" ${p.status === 'ongoing' ? 'selected' : ''}>Ongoing</option>
             <option value="on_hold" ${p.status === 'on_hold' ? 'selected' : ''}>On hold</option>
@@ -280,6 +340,10 @@ function renderProjectsAdmin() {
           </select>
           <span class="project-del-sm" onclick="deleteProjectAdmin('${p.id}')">✕ Delete</span>
         </div>
+      </div>
+      <div class="project-date-row">
+        <label>Start <input type="date" value="${p.startDate || ''}" onchange="setProjectDates('${p.id}','start',this.value)"></label>
+        <label>Target <input type="date" value="${p.targetDate || ''}" onchange="setProjectDates('${p.id}','target',this.value)"></label>
       </div>
       <div class="chip-list">
         ${data.members.length ? data.members.map((m) => `
@@ -289,38 +353,470 @@ function renderProjectsAdmin() {
     </div>`).join('') : '<div class="empty">No projects yet — add one below.</div>';
 }
 
-async function renderMyProjects() {
-  const el = document.getElementById('myProjectsList');
-  if (!el) return;
-  const session = getSession();
-  if (session) { try { myMemberId = await getMemberIdForAuthUser(session.user.id); } catch (e) { /* keep previous value */ } }
-  if (!myMemberId) {
-    el.innerHTML = '<div class="empty">Your login isn\'t linked to a team member yet. Ask your admin to add you in the Team tab using this same email address.</div>';
-    return;
-  }
-  const mine = projects.filter((p) => p.memberIds.includes(myMemberId));
-  if (!mine.length) { el.innerHTML = '<div class="empty">No projects assigned to you yet.</div>'; return; }
-  el.innerHTML = mine.map((p) => {
-    const hrsThisWeek = getProjects(selectedWeek, myMemberId).filter((a) => (a.project || '').trim().toLowerCase() === p.name.trim().toLowerCase()).reduce((s, a) => s + projectHours(a), 0);
-    return `
-    <div class="proj-item">
-      <div>
-        <div class="pname">${esc(p.name)}</div>
-        <div class="pmeta">Status: ${esc(p.status.replace('_', ' '))} · ${hrsThisWeek}h logged this week</div>
-      </div>
-      <button class="btn sm" onclick="logHoursForProject('${esc(p.name).replace(/'/g, "\\'")}')">Log hours</button>
-    </div>`;
-  }).join('');
+/* ================= Live Tracking (admin workspace, NEW) ================= */
+function populateLiveTrackProjectOptions() {
+  const sel = document.getElementById('liveTrackProjectSelect');
+  if (!sel) return;
+  const prev = sel.value;
+  const ongoing = projects.filter((p) => p.status === 'ongoing');
+  sel.innerHTML = ongoing.length
+    ? ongoing.map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join('')
+    : '<option value="">No ongoing projects</option>';
+  if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
 }
 
-window.logHoursForProject = function logHoursForProject(projectName) {
-  if (!myMemberId) { showToast('Your login isn\'t linked to a team member yet'); return; }
-  const existing = getProjects(selectedWeek, myMemberId).find((a) => (a.project || '').trim().toLowerCase() === projectName.trim().toLowerCase());
-  openModal(myMemberId, existing ? existing.id : null, existing ? null : projectName);
-  window.switchTab('board');
+async function renderLiveTracking() {
+  const sel = document.getElementById('liveTrackProjectSelect');
+  const statsEl = document.getElementById('liveTrackStats');
+  const membersEl = document.getElementById('liveTrackMembers');
+  const logsEl = document.getElementById('liveTrackLogs');
+  if (!sel || !statsEl || !membersEl || !logsEl) return;
+  const projectId = sel.value;
+  const project = projects.find((p) => p.id === projectId);
+  if (!project) {
+    statsEl.innerHTML = ''; membersEl.innerHTML = '<div class="empty">Create an ongoing project to see live tracking.</div>'; logsEl.innerHTML = '';
+    return;
+  }
+
+  let logs = [];
+  try { logs = await fetchTimeLogs({ projectId }); } catch (e) { logs = []; }
+
+  const assignedMembers = data.members.filter((m) => project.memberIds.includes(m.id));
+  const hoursByAuthUser = {};
+  logs.forEach((l) => { hoursByAuthUser[l.userId] = (hoursByAuthUser[l.userId] || 0) + l.duration; });
+  const totalSeconds = logs.reduce((s, l) => s + l.duration, 0);
+
+  statsEl.innerHTML = `
+    <div class="stat"><div class="label">Assigned members</div><div class="value">${assignedMembers.length}</div></div>
+    <div class="stat"><div class="label">Total logged</div><div class="value teal">${formatDuration(totalSeconds)}</div></div>
+    <div class="stat"><div class="label">Time entries</div><div class="value">${logs.length}</div></div>
+    <div class="stat"><div class="label">Status</div><div class="value">${esc(project.status.replace('_', ' '))}</div></div>
+  `;
+
+  membersEl.innerHTML = assignedMembers.length ? assignedMembers.map((m) => {
+    const secs = m.authUserId ? (hoursByAuthUser[m.authUserId] || 0) : 0;
+    return `<div class="livetrack-member-row"><span>${esc(m.name)}</span><span class="lt-hours">${formatDuration(secs)}</span></div>`;
+  }).join('') : '<div class="empty">No one is assigned to this project yet — assign members in the Projects tab.</div>';
+
+  const nameFor = (authUserId) => (data.members.find((m) => m.authUserId === authUserId)?.name) || 'Unknown member';
+  logsEl.innerHTML = logs.length ? logs.slice(0, 25).map((l) => `
+    <div class="log-item">
+      <div>
+        <div class="lname">${esc(nameFor(l.userId))}</div>
+        <div class="lmeta">${formatLogDate(l.startTime)}${l.notes ? ' · ' + esc(l.notes) : ''}<span class="log-tag">${l.isManual ? 'manual' : 'timer'}</span></div>
+      </div>
+      <div class="lhrs">${formatDuration(l.duration)}</div>
+    </div>`).join('') : '<div class="empty">No time logged against this project yet.</div>';
+}
+
+/* ================= Executive Roll-Up (admin workspace, NEW) =================
+   Visible to Admin/Boss and Super Admin alike (same .admin-only gating as
+   every other tab in this workspace — nothing here is super-admin-exclusive).
+   Everything is computed client-side from data already loaded for the admin
+   workspace (`data.members`, `data.assignments`, `projects`) — no new
+   queries beyond what fetchBoard()/fetchProjects() already provide.
+
+   Design notes on two judgment calls the spec left open:
+   - Billable vs Internal is classified per PROJECT (new `projects.billable`
+     column). A logged hour whose free-text project name doesn't match any
+     formal `projects` entity defaults to Billable, so untracked legacy work
+     isn't silently miscounted as internal overhead.
+   - The Free/Bench (<20h) · Optimal (20-40h) · Overallocated (>40h) bands
+     are calibrated to a standard 40h WEEK. To stay meaningful across the
+     Daily/Monthly/Quarterly views too, each member's allocation for the
+     selected period is converted to a "weekly-equivalent" figure (today's
+     hours × 5 for Daily; period total ÷ weeks-in-period for Monthly/
+     Quarterly) before the badge is chosen. */
+
+let execScope = 'weekly'; // 'daily' | 'weekly' | 'monthly' | 'quarterly'
+
+function round1(n) { return Math.round((n + Number.EPSILON) * 10) / 10; }
+
+/** Returns the assignments day-key ('mon'..'fri') for today, or null on a weekend. */
+function todayDayKey() {
+  const map = { 1: 'mon', 2: 'tue', 3: 'wed', 4: 'thu', 5: 'fri' };
+  return map[new Date().getDay()] || null;
+}
+
+/** { 'project name lowercased': billable boolean } built from the `projects` entities. */
+function billableMapFromProjects() {
+  const map = {};
+  projects.forEach((p) => { map[p.name.trim().toLowerCase()] = p.billable !== false; });
+  return map;
+}
+
+function buildExecWeekOptions() {
+  const sel = document.getElementById('execWeekSelect');
+  if (!sel) return;
+  if (sel.options.length !== weeks.length) {
+    sel.innerHTML = weeks.map((w) => `<option value="${w}">${w}</option>`).join('');
+  }
+  if (!sel.value) sel.value = weeks.includes(currentWeekLabel()) ? currentWeekLabel() : (weeks[0] || '');
+}
+
+function buildExecPeriodOptions(scope) {
+  const sel = document.getElementById('execPeriodSelect');
+  if (!sel) return;
+  const keys = [...new Set(allTrackedWeeks().map((w) => periodKeyOf(parseWeekMonday(w), scope)).filter(Boolean))].sort();
+  const prev = sel.value;
+  sel.innerHTML = keys.map((k) => `<option value="${k}">${periodLabelOf(k, scope)}</option>`).join('');
+  const curKey = periodKeyOf(new Date(), scope);
+  if (keys.includes(prev)) sel.value = prev;
+  else if (keys.includes(curKey)) sel.value = curKey;
+  else if (keys.length) sel.value = keys[keys.length - 1];
+}
+
+/** Shows/hides the right control for the current scope and (re)populates it. */
+function refreshExecControls() {
+  const weekSel = document.getElementById('execWeekSelect');
+  const periodSel = document.getElementById('execPeriodSelect');
+  const dailyLabel = document.getElementById('execDailyLabel');
+  if (!weekSel || !periodSel || !dailyLabel) return;
+  weekSel.style.display = execScope === 'weekly' ? '' : 'none';
+  periodSel.style.display = (execScope === 'monthly' || execScope === 'quarterly') ? '' : 'none';
+  dailyLabel.style.display = execScope === 'daily' ? '' : 'none';
+  if (execScope === 'weekly') buildExecWeekOptions();
+  if (execScope === 'monthly' || execScope === 'quarterly') buildExecPeriodOptions(execScope);
+  if (execScope === 'daily') dailyLabel.textContent = `Today — ${fmtDMY(new Date())}`;
+}
+
+window.setExecScope = function setExecScope(scope) {
+  execScope = scope;
+  document.querySelectorAll('#execScopeToggle button').forEach((b) => b.classList.toggle('active', b.dataset.scope === scope));
+  refreshExecControls();
+  renderExecutiveDashboard();
 };
 
-/* ================= Projects (per-week hour logging) ================= */
+/** Resolves the current scope selection into the list of week-labels it covers. */
+function execWeeksList() {
+  if (execScope === 'daily') return { weeksList: [currentWeekLabel()], isDaily: true };
+  if (execScope === 'weekly') {
+    const sel = document.getElementById('execWeekSelect');
+    const w = (sel && sel.value) || currentWeekLabel();
+    return { weeksList: [w], isDaily: false };
+  }
+  const sel = document.getElementById('execPeriodSelect');
+  const key = sel && sel.value;
+  return { weeksList: key ? weeksInPeriod(execScope, key) : [], isDaily: false };
+}
+
+function renderExecutiveDashboard() {
+  const kpiEl = document.getElementById('execKpiStrip');
+  const statusEl = document.getElementById('execStatusBreakdown');
+  const tableEl = document.getElementById('execAvailabilityTable');
+  if (!kpiEl || !statusEl || !tableEl) return;
+
+  const { weeksList, isDaily } = execWeeksList();
+  const nW = (execScope === 'monthly' || execScope === 'quarterly') ? (weeksList.length || 1) : 1;
+  const dayKey = isDaily ? todayDayKey() : null;
+  const billableMap = billableMapFromProjects();
+
+  let totalCapacity = 0, totalAllocated = 0, billableHrs = 0, internalHrs = 0;
+
+  const rows = data.members.map((m) => {
+    const capPerWeek = memberCapacity(m);
+    let periodCapacity;
+    if (isDaily) periodCapacity = capPerWeek / 5;
+    else if (execScope === 'weekly') periodCapacity = capPerWeek;
+    else periodCapacity = capPerWeek * nW;
+
+    let periodAllocated = 0;
+    weeksList.forEach((w) => {
+      getProjects(w, m.id).forEach((p) => {
+        const hrs = isDaily ? (dayKey ? (Number(p.days[dayKey]) || 0) : 0) : projectHours(p);
+        periodAllocated += hrs;
+        const key = (p.project || '').trim().toLowerCase();
+        const billable = Object.prototype.hasOwnProperty.call(billableMap, key) ? billableMap[key] : true;
+        if (billable) billableHrs += hrs; else internalHrs += hrs;
+      });
+    });
+
+    const availability = periodCapacity - periodAllocated;
+    const weeklyEquiv = isDaily ? periodAllocated * 5 : (execScope === 'weekly' ? periodAllocated : periodAllocated / nW);
+    let badge, badgeClass;
+    if (weeklyEquiv > 40) { badge = 'Overallocated'; badgeClass = 'flag-over'; }
+    else if (weeklyEquiv >= 20) { badge = 'Optimal'; badgeClass = 'flag-ok'; }
+    else { badge = 'Free / Bench'; badgeClass = 'flag-free'; }
+
+    // Forecasted free date: latest deadline among this member's not-yet-Done
+    // assignments across every tracked week — i.e. when they're expected to
+    // clear their current backlog, assuming nothing new lands on their plate.
+    let latestDeadline = null;
+    allTrackedWeeks().forEach((w) => {
+      getProjects(w, m.id).forEach((p) => {
+        if (p.status !== 'Done' && p.deadline) {
+          const d = new Date(p.deadline + 'T00:00:00');
+          if (!isNaN(d) && (!latestDeadline || d > latestDeadline)) latestDeadline = d;
+        }
+      });
+    });
+
+    totalCapacity += periodCapacity;
+    totalAllocated += periodAllocated;
+
+    return { name: m.name, periodCapacity, periodAllocated, availability, badge, badgeClass, latestDeadline };
+  }).sort((a, b) => b.periodAllocated - a.periodAllocated);
+
+  const utilPct = totalCapacity > 0 ? Math.round(totalAllocated / totalCapacity * 100) : 0;
+
+  kpiEl.innerHTML = `
+    <div class="stat"><div class="label">Headcount</div><div class="value">${data.members.length}</div></div>
+    <div class="stat"><div class="label">Capacity (period)</div><div class="value">${round1(totalCapacity)}h</div></div>
+    <div class="stat"><div class="label">Allocated (period)</div><div class="value teal">${round1(totalAllocated)}h</div></div>
+    <div class="stat"><div class="label">Utilization</div><div class="value accent">${utilPct}%</div></div>
+    <div class="stat"><div class="label">Billable hrs</div><div class="value">${round1(billableHrs)}h</div></div>
+    <div class="stat"><div class="label">Internal hrs</div><div class="value">${round1(internalHrs)}h</div></div>
+  `;
+
+  const statusCounts = { ongoing: 0, on_hold: 0, completed: 0 };
+  projects.forEach((p) => { if (statusCounts[p.status] !== undefined) statusCounts[p.status]++; });
+  statusEl.innerHTML = `
+    <div class="stats" style="margin-bottom:0;">
+      <div class="stat"><div class="label">Ongoing</div><div class="value teal">${statusCounts.ongoing}</div></div>
+      <div class="stat"><div class="label">On hold</div><div class="value accent">${statusCounts.on_hold}</div></div>
+      <div class="stat"><div class="label">Completed</div><div class="value">${statusCounts.completed}</div></div>
+      <div class="stat"><div class="label">Total projects</div><div class="value">${projects.length}</div></div>
+    </div>
+  `;
+
+  tableEl.innerHTML = rows.length ? rows.map((r) => `
+    <tr>
+      <td class="nm">${esc(r.name)}</td>
+      <td>${round1(r.periodCapacity)}h</td>
+      <td>${round1(r.periodAllocated)}h</td>
+      <td style="color:${r.availability < 0 ? 'var(--danger)' : 'var(--text)'}">${round1(r.availability)}h</td>
+      <td><span class="flag ${r.badgeClass}">${r.badge}</span></td>
+      <td>${r.latestDeadline ? fmtDMY(r.latestDeadline) : 'Available now'}</td>
+    </tr>`).join('') : '<tr><td colspan="6" class="empty">No team members.</td></tr>';
+}
+window.renderExecutiveDashboard = renderExecutiveDashboard;
+
+/* ================= Project Timeline & History (admin workspace, NEW) =================
+   Same .admin-only tier gating as the rest of this workspace. */
+
+/**
+ * Resolves a project's displayed date range. If the admin has set explicit
+ * start/target dates (Projects tab), those win. Otherwise this falls back
+ * to inferring a range from the legacy `assignments` records that match
+ * the project's name: earliest week worked → latest deadline on file.
+ * Returns Date objects (or null), for use in date math.
+ */
+function resolveProjectDateRange(p) {
+  let start = p.startDate ? new Date(p.startDate + 'T00:00:00') : null;
+  let target = p.targetDate ? new Date(p.targetDate + 'T00:00:00') : null;
+  if (start && isNaN(start)) start = null;
+  if (target && isNaN(target)) target = null;
+  if (start && target) return { start, target };
+
+  let earliestMonday = null, latestDeadline = null;
+  allTrackedWeeks().forEach((w) => {
+    const monday = parseWeekMonday(w);
+    data.members.forEach((m) => {
+      getProjects(w, m.id).forEach((row) => {
+        if ((row.project || '').trim().toLowerCase() !== p.name.trim().toLowerCase()) return;
+        if (monday && (!earliestMonday || monday < earliestMonday)) earliestMonday = monday;
+        if (row.deadline) {
+          const d = new Date(row.deadline + 'T00:00:00');
+          if (!isNaN(d) && (!latestDeadline || d > latestDeadline)) latestDeadline = d;
+        }
+      });
+    });
+  });
+  return { start: start || earliestMonday, target: target || latestDeadline };
+}
+
+function renderTimelineChart() {
+  const el = document.getElementById('timelineChart');
+  if (!el) return;
+  const shown = projects.filter((p) => p.status !== 'completed');
+  if (!shown.length) { el.innerHTML = '<div class="empty">No ongoing or on-hold projects to show. Completed projects appear in Project History below.</div>'; return; }
+
+  const ranges = shown.map((p) => ({ p, ...resolveProjectDateRange(p) }));
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const starts = ranges.map((r) => r.start).filter(Boolean).map((d) => d.getTime());
+  const targets = ranges.map((r) => r.target).filter(Boolean).map((d) => d.getTime());
+  const windowStart = new Date(Math.min(today.getTime(), ...(starts.length ? starts : [today.getTime()])));
+  const windowEnd = new Date(Math.max(today.getTime() + 7 * 86400000, ...(targets.length ? targets : [today.getTime() + 30 * 86400000])));
+  const totalMs = Math.max(1, windowEnd.getTime() - windowStart.getTime());
+  const todayPct = Math.min(100, Math.max(0, (today.getTime() - windowStart.getTime()) / totalMs * 100));
+
+  el.innerHTML = `
+    <div class="timeline-window-label">${fmtDMY(windowStart)} — ${fmtDMY(windowEnd)} (today marked in red)</div>
+    ${ranges.map(({ p, start, target }) => {
+      const s = start || today, t = target || today;
+      const leftPct = Math.min(100, Math.max(0, (s.getTime() - windowStart.getTime()) / totalMs * 100));
+      const widthPct = Math.max(1.5, Math.min(100 - leftPct, (t.getTime() - s.getTime()) / totalMs * 100));
+      const contributors = data.members.filter((m) => p.memberIds.includes(m.id)).map((m) => m.name);
+      return `
+      <div class="timeline-row">
+        <div class="timeline-row-label">
+          <span class="timeline-proj-name">${esc(p.name)}</span>
+          <span class="timeline-contributors">${contributors.length ? esc(contributors.join(', ')) : 'Unstaffed'} · ${start ? fmtDMY(start) : '?'} – ${target ? fmtDMY(target) : '?'}</span>
+        </div>
+        <div class="timeline-track">
+          <div class="timeline-bar ${p.status}" style="left:${leftPct}%;width:${widthPct}%;"></div>
+          <div class="timeline-today-mark" style="left:${todayPct}%;"></div>
+        </div>
+      </div>`;
+    }).join('')}
+  `;
+}
+
+function describeAuditAction(l) {
+  const d = l.details || {};
+  switch (l.action) {
+    case 'created': return `Project "${d.projectName || ''}" created`;
+    case 'status_changed': return `Status changed: ${(d.from || '?').replace('_', ' ')} → ${(d.to || '?').replace('_', ' ')}`;
+    case 'dates_updated': return `Timeline updated${d.startDate ? ' · start ' + d.startDate : ''}${d.targetDate ? ' · target ' + d.targetDate : ''}`;
+    case 'deleted': return `Project "${d.projectName || ''}" deleted`;
+    case 'assigned': return `${d.memberName || 'A member'} assigned to ${d.projectName || 'this project'}`;
+    case 'unassigned': return `${d.memberName || 'A member'} removed from ${d.projectName || 'this project'}`;
+    case 'role_changed': return `Role changed to ${(d.to || '?').replace('_', ' ')}${d.email ? ' — ' + d.email : ''}`;
+    default: return l.action;
+  }
+}
+
+function populateHistorySelectors() {
+  const projSel = document.getElementById('historyProjectSelect');
+  if (projSel) {
+    const prev = projSel.value;
+    projSel.innerHTML = projects.length ? projects.map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join('') : '<option value="">No projects yet</option>';
+    if ([...projSel.options].some((o) => o.value === prev)) projSel.value = prev;
+  }
+  const memSel = document.getElementById('historyMemberSelect');
+  if (memSel) {
+    const prev = memSel.value;
+    memSel.innerHTML = data.members.length ? data.members.map((m) => `<option value="${m.id}">${esc(m.name)}</option>`).join('') : '<option value="">No members yet</option>';
+    if ([...memSel.options].some((o) => o.value === prev)) memSel.value = prev;
+  }
+}
+
+async function renderProjectHistory() {
+  const sel = document.getElementById('historyProjectSelect');
+  const el = document.getElementById('projectHistoryList');
+  if (!sel || !el) return;
+  const projectId = sel.value;
+  if (!projectId) { el.innerHTML = '<div class="empty">No projects yet.</div>'; return; }
+  let logs = [];
+  try { logs = await fetchAuditLogs({ entityId: projectId }); } catch (e) { logs = []; }
+  el.innerHTML = logs.length ? logs.map((l) => `
+    <div class="log-item">
+      <div>
+        <div class="lname">${esc(describeAuditAction(l))}</div>
+        <div class="lmeta">${formatLogDate(l.created_at)} · ${esc(l.actor_email || 'system')}</div>
+      </div>
+    </div>`).join('') : '<div class="empty">No history recorded for this project yet.</div>';
+}
+window.renderProjectHistory = renderProjectHistory;
+
+async function renderMemberHistory() {
+  const sel = document.getElementById('historyMemberSelect');
+  const el = document.getElementById('memberHistoryList');
+  if (!sel || !el) return;
+  const memberId = sel.value;
+  if (!memberId) { el.innerHTML = '<div class="empty">No team members yet.</div>'; return; }
+  let logs = [];
+  try { logs = await fetchAuditLogs({ secondaryEntityId: memberId }); } catch (e) { logs = []; }
+  el.innerHTML = logs.length ? logs.map((l) => {
+    const proj = projects.find((p) => p.id === l.entity_id);
+    return `
+    <div class="log-item">
+      <div>
+        <div class="lname">${esc(describeAuditAction(l))}</div>
+        <div class="lmeta">${formatLogDate(l.created_at)}${proj ? ' · currently ' + esc(proj.status.replace('_', ' ')) : ' · project no longer exists'}</div>
+      </div>
+    </div>`;
+  }).join('') : '<div class="empty">No assignment history recorded for this member yet.</div>';
+}
+window.renderMemberHistory = renderMemberHistory;
+
+/* ================= Dual Excel Export Engine (admin workspace, NEW) ================= */
+
+function buildPerMemberBoardRows() {
+  const rows = [];
+  allTrackedWeeks().forEach((w) => {
+    data.members.forEach((m) => {
+      const cap = memberCapacity(m);
+      const hrs = memberHours(w, m.id);
+      const pct = cap > 0 ? Math.round(hrs / cap * 100) : 0;
+      getProjects(w, m.id).forEach((p) => {
+        rows.push({
+          member: m.name, week: w, project: p.project,
+          mon: p.days.mon, tue: p.days.tue, wed: p.days.wed, thu: p.days.thu, fri: p.days.fri,
+          total: projectHours(p), priority: p.priority, status: p.status, capacity: cap, utilizationPct: pct,
+        });
+      });
+    });
+  });
+  return rows;
+}
+
+async function buildTimeLogRowsForExport() {
+  let logs = [];
+  try { logs = await fetchTimeLogs({}); } catch (e) { logs = []; }
+  const memberByAuthUser = {};
+  data.members.forEach((m) => { if (m.authUserId) memberByAuthUser[m.authUserId] = m.name; });
+  const projectNameById = {};
+  projects.forEach((p) => { projectNameById[p.id] = p.name; });
+  return logs.map((l) => ({
+    member: memberByAuthUser[l.userId] || 'Unknown',
+    project: projectNameById[l.projectId] || 'Unknown project',
+    date: formatLogDate(l.startTime),
+    durationHrs: round1(l.duration / 3600),
+    isManual: l.isManual,
+    notes: l.notes || '',
+  }));
+}
+
+async function runPerMemberExport(format) {
+  const boardRows = buildPerMemberBoardRows();
+  const timeLogRows = await buildTimeLogRowsForExport();
+  exportPerMemberReport(boardRows, timeLogRows, format);
+  showToast('Per-member report downloaded');
+}
+window.exportPerMemberXlsx = () => runPerMemberExport('xlsx');
+window.exportPerMemberCsv = () => runPerMemberExport('csv');
+
+function buildPerProjectRowsBase() {
+  return projects.map((p) => {
+    const contributors = data.members.filter((m) => p.memberIds.includes(m.id)).map((m) => m.name).join(', ');
+    const { start, target } = resolveProjectDateRange(p);
+    let boardHours = 0;
+    allTrackedWeeks().forEach((w) => {
+      data.members.forEach((m) => {
+        getProjects(w, m.id).forEach((row) => {
+          if ((row.project || '').trim().toLowerCase() === p.name.trim().toLowerCase()) boardHours += projectHours(row);
+        });
+      });
+    });
+    return {
+      project: p.name, status: p.status.replace('_', ' '), billable: p.billable !== false,
+      contributors: contributors || '—', hoursLoggedTimer: 0, hoursLoggedBoard: round1(boardHours),
+      startDate: start ? fmtDMY(start) : '', targetDate: target ? fmtDMY(target) : '',
+      completedAt: p.completedAt ? fmtDMY(new Date(p.completedAt)) : '',
+      _id: p.id,
+    };
+  });
+}
+
+async function attachTimerHoursToRows(rows) {
+  let logs = [];
+  try { logs = await fetchTimeLogs({}); } catch (e) { logs = []; }
+  const secondsByProjectId = {};
+  logs.forEach((l) => { secondsByProjectId[l.projectId] = (secondsByProjectId[l.projectId] || 0) + l.duration; });
+  rows.forEach((r) => { r.hoursLoggedTimer = round1((secondsByProjectId[r._id] || 0) / 3600); delete r._id; });
+  return rows;
+}
+
+async function runPerProjectExport(format) {
+  const rows = await attachTimerHoursToRows(buildPerProjectRowsBase());
+  exportPerProjectReport(rows, format);
+  showToast('Per-project report downloaded');
+}
+window.exportPerProjectXlsx = () => runPerProjectExport('xlsx');
+window.exportPerProjectCsv = () => runPerProjectExport('csv');
+
+/* ================= Projects (per-week hour logging — admin workspace) ================= */
 window.openModal = function openModal(memberId, projectId, prefillProject) {
   editCtx = { memberId, projectId };
   const member = data.members.find((m) => m.id === memberId);
@@ -384,7 +880,7 @@ window.deleteProject = async function deleteProject(memberId, projectId) {
   } catch (e) { showToast('Could not delete'); }
 };
 
-/* ================= Render ================= */
+/* ================= Render (admin workspace) ================= */
 function render() {
   const ws = document.getElementById('weekSelect');
   if (ws.options.length !== weeks.length) {
@@ -399,8 +895,11 @@ function render() {
   renderPeople();
   renderOverview();
   renderTeam();
+  if (document.getElementById('tab-team') && document.getElementById('tab-team').style.display !== 'none') renderRoleManagement();
   if (document.getElementById('tab-projects') && document.getElementById('tab-projects').style.display !== 'none') renderProjectsAdmin();
-  if (document.getElementById('tab-myprojects') && document.getElementById('tab-myprojects').style.display !== 'none') renderMyProjects();
+  if (document.getElementById('tab-livetracking') && document.getElementById('tab-livetracking').style.display !== 'none') { populateLiveTrackProjectOptions(); renderLiveTracking(); }
+  if (document.getElementById('tab-exec') && document.getElementById('tab-exec').style.display !== 'none') { refreshExecControls(); renderExecutiveDashboard(); }
+  if (document.getElementById('tab-timeline') && document.getElementById('tab-timeline').style.display !== 'none') { renderTimelineChart(); populateHistorySelectors(); renderProjectHistory(); renderMemberHistory(); }
 }
 
 function renderStats() {
@@ -434,7 +933,7 @@ function renderPeople() {
     const cap = memberCapacity(m);
     const hrs = memberHours(selectedWeek, m.id);
     const pct = cap > 0 ? Math.round(hrs / cap * 100) : 0;
-    const projects = filterActive
+    const projectsForMember = filterActive
       ? getProjects(selectedWeek, m.id).filter((p) => (p.project || '').trim().toLowerCase() === projectFilter.trim().toLowerCase())
       : getProjects(selectedWeek, m.id);
     return `
@@ -453,7 +952,7 @@ function renderPeople() {
         <div class="load-track"><div class="load-fill" style="width:${Math.min(pct, 100)}%;background:${loadColor(pct)}"></div>${pct >= 100 ? '<div class="load-tick"></div>' : ''}</div>
       </div>
       <ul class="projects">
-        ${projects.length ? projects.map((p) => {
+        ${projectsForMember.length ? projectsForMember.map((p) => {
           const dl = deadlineInfo(p.deadline);
           return `
           <li class="project">
@@ -499,16 +998,19 @@ function renderTeam() {
   document.getElementById('memberCount').textContent = data.members.length;
   const el = document.getElementById('teamList');
   el.innerHTML = data.members.length ? data.members.map((m) => `
-    <div class="ov-row" style="grid-template-columns:1fr auto auto;gap:18px;">
+    <div class="ov-row" style="grid-template-columns:1fr auto auto auto;gap:18px;">
       <div style="display:flex;align-items:center;gap:10px;">
         <div class="avatar">${initials(m.name)}</div>
         <span class="ov-name">${esc(m.name)}</span>
       </div>
-      <div class="cap-cell admin-only">
+      <div class="email-cell">
+        <input type="email" placeholder="email@adobe.com" value="${esc(m.email || '')}" onchange="setMemberEmail('${m.id}', this.value)">
+      </div>
+      <div class="cap-cell">
         Capacity
         <input type="number" min="1" step="1" value="${memberCapacity(m)}" onchange="setMemberCapacity('${m.id}', this.value)"> hrs/wk
       </div>
-      <span class="person-del admin-only" onclick="removeMember('${m.id}')">Remove</span>
+      <span class="person-del" onclick="removeMember('${m.id}')">Remove</span>
     </div>`).join('') : '<div class="empty">No members yet.</div>';
 }
 
@@ -557,8 +1059,9 @@ function renderRollup() {
     : '<div class="empty">Nothing delivered yet.</div>';
 }
 window.renderRollup = renderRollup;
+window.renderLiveTracking = renderLiveTracking;
 
-/* ================= Import / Export ================= */
+/* ================= Import / Export (admin workspace) ================= */
 document.getElementById('importFile').addEventListener('change', function (e) {
   const file = e.target.files[0]; if (!file) return;
   const reader = new FileReader();
@@ -613,13 +1116,7 @@ async function importRows(rows) {
     if (!weeks.includes(curWeek)) weeks.push(curWeek);
 
     let mid = nameToId[curMember.toLowerCase()];
-    if (!mid) {
-      if (!admin) { continue; } // only admins can create new members; skip row for unknown members
-      try {
-        const nm = await insertMember(curMember, data.capacity);
-        data.members.push(nm); nameToId[curMember.toLowerCase()] = nm.id; mid = nm.id;
-      } catch (e) { continue; }
-    }
+    if (!mid) { continue; } // Team tab now requires an email at creation time; import never creates new members.
     if (ci.capacity >= 0 && admin) {
       const capv = parseFloat(row[ci.capacity]);
       if (capv > 0) { const mm = data.members.find((x) => x.id === mid); if (mm && mm.capacity !== capv) { try { await updateMemberCapacity(mid, capv); mm.capacity = capv; } catch (e) {} } }
@@ -649,7 +1146,7 @@ async function importRows(rows) {
   }
   weeks.sort((a, b) => new Date(a.slice(0, 11).replace(/-/g, ' ')) - new Date(b.slice(0, 11).replace(/-/g, ' ')));
   render();
-  showToast(`Imported ${added} project row(s)${admin ? '' : ' (new members skipped — admin only)'}`);
+  showToast(`Imported ${added} project row(s) (rows for members not already in Team were skipped)`);
 }
 
 window.exportExcel = function exportExcel() {
@@ -664,12 +1161,12 @@ window.exportExcel = function exportExcel() {
   orderWeeks.forEach((w) => {
     data.members.forEach((m) => {
       const cap = memberCapacity(m);
-      const projects = getProjects(w, m.id);
+      const projectsForMember = getProjects(w, m.id);
       const hrs = memberHours(w, m.id);
       const pct = cap > 0 ? Math.round(hrs / cap * 100) + '%' : '';
-      const rowsForMember = Math.max(projects.length, 1);
+      const rowsForMember = Math.max(projectsForMember.length, 1);
       for (let i = 0; i < rowsForMember; i++) {
-        const p = projects[i]; const d = p && p.days ? p.days : {};
+        const p = projectsForMember[i]; const d = p && p.days ? p.days : {};
         aoa.push([
           i === 0 ? w : '', i === 0 ? m.name : '', p ? p.project : '', p && p.deadline ? p.deadline : '',
           p ? (Number(d.mon) || 0) : '', p ? (Number(d.tue) || 0) : '', p ? (Number(d.wed) || 0) : '', p ? (Number(d.thu) || 0) : '', p ? (Number(d.fri) || 0) : '',
@@ -686,16 +1183,16 @@ window.exportExcel = function exportExcel() {
   XLSX.writeFile(wb, `POD_Weekly_Tracker_${new Date().toISOString().slice(0, 10)}.xlsx`);
 };
 
-/* ================= Branding (admin only) ================= */
+/* ================= Branding (super-admin only to edit; every workspace displays it) ================= */
 const DEFAULT_MARK_SVG = '<svg viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><circle cx="20" cy="20" r="14.5" fill="none" stroke="currentColor" stroke-width="3.2"/><path d="M16.5 13.5 L16.5 26.5 L27 20 Z" fill="currentColor"/></svg>';
 function applyLogo() {
   const mark = document.getElementById('brandMark');
   const staticMark = document.getElementById('brandMarkStatic');
   const reset = document.getElementById('markReset');
-  const target = isAdmin() ? mark : staticMark;
-  mark.style.display = isAdmin() ? 'flex' : 'none';
-  staticMark.style.display = isAdmin() ? 'none' : 'flex';
-  if (data.logo) { target.innerHTML = `<img src="${data.logo}" alt="logo">`; if (reset) reset.style.display = isAdmin() ? 'flex' : 'none'; }
+  const target = isSuperAdmin() ? mark : staticMark;
+  mark.style.display = isSuperAdmin() ? 'flex' : 'none';
+  staticMark.style.display = isSuperAdmin() ? 'none' : 'flex';
+  if (data.logo) { target.innerHTML = `<img src="${data.logo}" alt="logo">`; if (reset) reset.style.display = isSuperAdmin() ? 'flex' : 'none'; }
   else { target.innerHTML = DEFAULT_MARK_SVG; if (reset) reset.style.display = 'none'; }
 }
 function setupLogo() {
@@ -709,7 +1206,7 @@ function setupLogo() {
     const r = new FileReader();
     r.onload = async () => {
       try { await updateAppSettings({ logo_data: r.result }); data.logo = r.result; applyLogo(); showToast('Logo updated'); }
-      catch (err) { showToast('Only admins can change the logo'); }
+      catch (err) { showToast('Only super admins can change the logo'); }
     };
     r.readAsDataURL(f);
     e.target.value = '';
@@ -717,7 +1214,7 @@ function setupLogo() {
   reset.addEventListener('click', async (ev) => {
     ev.stopPropagation();
     try { await updateAppSettings({ logo_data: null }); data.logo = null; applyLogo(); showToast('Logo reset'); }
-    catch (err) { showToast('Only admins can change the logo'); }
+    catch (err) { showToast('Only super admins can change the logo'); }
   });
 }
 function applyAppName() {
@@ -733,29 +1230,370 @@ async function commitAppName() {
   const el = document.getElementById('brandName');
   let name = el.textContent.replace(/\s+/g, ' ').trim(); if (!name) name = 'POD Board';
   try { await updateAppSettings({ app_name: name }); data.appName = name; el.textContent = name; applyAppName(); showToast('Renamed'); }
-  catch (e) { showToast('Only admins can rename the board'); applyAppName(); }
+  catch (e) { showToast('Only super admins can rename the board'); applyAppName(); }
 }
 async function commitTagline() {
   const el = document.getElementById('brandTagline');
   let tag = el.textContent.replace(/\s+/g, ' ').trim(); if (!tag) tag = 'Weekly Capacity Tracker';
   try { await updateAppSettings({ tagline: tag }); data.tagline = tag; el.textContent = tag; applyAppName(); showToast('Tagline updated'); }
-  catch (e) { showToast('Only admins can edit the tagline'); applyAppName(); }
+  catch (e) { showToast('Only super admins can edit the tagline'); applyAppName(); }
 }
 function setupRename() {
   const el = document.getElementById('brandName');
-  el.contentEditable = isAdmin() ? 'true' : 'false';
+  el.contentEditable = isSuperAdmin() ? 'true' : 'false';
   el.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); el.blur(); } });
   el.addEventListener('blur', commitAppName);
   const tel = document.getElementById('brandTagline');
-  tel.contentEditable = isAdmin() ? 'true' : 'false';
+  tel.contentEditable = isSuperAdmin() ? 'true' : 'false';
   tel.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); tel.blur(); } });
   tel.addEventListener('blur', commitTagline);
 }
 
+/* ================= Account roles (super-admin only, Phase 1 RBAC) ================= */
+let allProfiles = []; // [{id,email,role}] — only ever fetched/rendered for a super admin
+
+async function renderRoleManagement() {
+  const el = document.getElementById('roleManagementList');
+  if (!el || !isSuperAdmin()) return;
+  try { allProfiles = await fetchAllProfiles(); } catch (e) { el.innerHTML = '<div class="empty">Could not load accounts.</div>'; return; }
+  el.innerHTML = allProfiles.length ? allProfiles.map((p) => {
+    const isHardCodedSuper = p.role === 'super_admin';
+    return `
+    <div class="role-row">
+      <span class="role-email">${esc(p.email)}</span>
+      ${isHardCodedSuper
+        ? '<span class="role-tag-super">Super Admin</span>'
+        : `<select class="mini-select" onchange="setProfileRole('${p.id}', this.value)">
+             <option value="member" ${p.role === 'member' ? 'selected' : ''}>Member</option>
+             <option value="admin" ${p.role === 'admin' ? 'selected' : ''}>Admin / Boss</option>
+           </select>`}
+    </div>`;
+  }).join('') : '<div class="empty">No one has signed in yet.</div>';
+}
+window.setProfileRole = async function setProfileRole(userId, role) {
+  const p = allProfiles.find((x) => x.id === userId);
+  try {
+    await updateProfileRole(userId, role, { email: p?.email });
+    if (p) p.role = role;
+    showToast('Role updated');
+  } catch (e) { showToast('Only super admins can change roles'); renderRoleManagement(); }
+};
+
+/* ============================================================
+   ================= MEMBER WORKSPACE (NEW) ===================
+   ============================================================
+   Strictly isolated from the admin workspace: never calls fetchBoard()
+   (which is admin-scoped by RLS), only ever touches `projects` /
+   `project_assignments` / `time_logs` rows the signed-in user is allowed
+   to see, per the RLS policies in supabase/schema_update.sql. */
+
+let memberProjects = []; // projects assigned to this member (already RLS-scoped)
+let myTimeLogs = [];     // this member's own time log rows
+
+const timerState = {
+  running: false,
+  projectId: null,
+  projectName: '',
+  firstStart: null,       // ISO timestamp of when the timer was first started (for this session)
+  segmentStart: null,     // Date when the current running segment began (null while paused)
+  accumulatedSeconds: 0,  // seconds banked from previous segments (before the current running one)
+  intervalId: null,
+};
+
+function elapsedTimerSeconds() {
+  const running = timerState.segmentStart ? (Date.now() - timerState.segmentStart.getTime()) / 1000 : 0;
+  return timerState.accumulatedSeconds + running;
+}
+function formatClock(totalSeconds) {
+  const s = Math.max(0, Math.floor(totalSeconds));
+  const hh = pad(Math.floor(s / 3600));
+  const mm = pad(Math.floor((s % 3600) / 60));
+  const ss = pad(s % 60);
+  return `${hh}:${mm}:${ss}`;
+}
+function tickTimerDisplay() {
+  const el = document.getElementById('timerDisplay');
+  if (el) el.textContent = formatClock(elapsedTimerSeconds());
+}
+
+window.startTimer = function startTimer() {
+  const sel = document.getElementById('timerProjectSelect');
+  if (!sel || !sel.value) { showToast('Choose a project first'); return; }
+  timerState.running = true;
+  timerState.projectId = sel.value;
+  timerState.projectName = sel.options[sel.selectedIndex]?.text || '';
+  timerState.firstStart = new Date().toISOString();
+  timerState.accumulatedSeconds = 0;
+  timerState.segmentStart = new Date();
+  timerState.intervalId = setInterval(tickTimerDisplay, 1000);
+  tickTimerDisplay();
+  sel.disabled = true;
+  document.getElementById('timerStartBtn').style.display = 'none';
+  document.getElementById('timerPauseBtn').style.display = '';
+  document.getElementById('timerResumeBtn').style.display = 'none';
+  document.getElementById('timerStopBtn').style.display = '';
+};
+window.pauseTimer = function pauseTimer() {
+  if (!timerState.segmentStart) return;
+  timerState.accumulatedSeconds += (Date.now() - timerState.segmentStart.getTime()) / 1000;
+  timerState.segmentStart = null;
+  timerState.running = false;
+  clearInterval(timerState.intervalId); timerState.intervalId = null;
+  tickTimerDisplay();
+  document.getElementById('timerPauseBtn').style.display = 'none';
+  document.getElementById('timerResumeBtn').style.display = '';
+};
+window.resumeTimer = function resumeTimer() {
+  timerState.segmentStart = new Date();
+  timerState.running = true;
+  timerState.intervalId = setInterval(tickTimerDisplay, 1000);
+  document.getElementById('timerPauseBtn').style.display = '';
+  document.getElementById('timerResumeBtn').style.display = 'none';
+};
+window.stopTimer = async function stopTimer() {
+  const totalSeconds = elapsedTimerSeconds();
+  clearInterval(timerState.intervalId); timerState.intervalId = null;
+  const session = getSession();
+  if (session && timerState.projectId && totalSeconds >= 1) {
+    try {
+      await insertTimeLog({
+        userId: session.user.id,
+        projectId: timerState.projectId,
+        durationSeconds: totalSeconds,
+        startTime: timerState.firstStart,
+        endTime: new Date().toISOString(),
+        notes: null,
+        isManual: false,
+      });
+      showToast(`Saved ${formatDuration(totalSeconds)} on ${timerState.projectName}`);
+    } catch (e) { showToast('Could not save your time — check your connection'); }
+  }
+  timerState.running = false; timerState.projectId = null; timerState.projectName = '';
+  timerState.firstStart = null; timerState.segmentStart = null; timerState.accumulatedSeconds = 0;
+  const sel = document.getElementById('timerProjectSelect');
+  if (sel) sel.disabled = false;
+  const disp = document.getElementById('timerDisplay'); if (disp) disp.textContent = '00:00:00';
+  document.getElementById('timerStartBtn').style.display = '';
+  document.getElementById('timerPauseBtn').style.display = 'none';
+  document.getElementById('timerResumeBtn').style.display = 'none';
+  document.getElementById('timerStopBtn').style.display = 'none';
+  await loadMemberWorkspaceData();
+  renderMemberWorkspace();
+};
+
+window.submitManualEntry = async function submitManualEntry() {
+  const sel = document.getElementById('manualProjectSelect');
+  const dateEl = document.getElementById('manualDate');
+  const hrsEl = document.getElementById('manualHours');
+  const minsEl = document.getElementById('manualMinutes');
+  const notesEl = document.getElementById('manualNotes');
+  if (!sel || !sel.value) { showToast('Choose a project'); return; }
+  const hours = parseInt(hrsEl.value, 10) || 0;
+  const minutes = parseInt(minsEl.value, 10) || 0;
+  const durationSeconds = hours * 3600 + minutes * 60;
+  if (durationSeconds <= 0) { showToast('Enter hours and/or minutes'); return; }
+  const dateVal = dateEl.value || new Date().toISOString().slice(0, 10);
+  const session = getSession();
+  if (!session) return;
+  try {
+    await insertTimeLog({
+      userId: session.user.id,
+      projectId: sel.value,
+      durationSeconds,
+      startTime: `${dateVal}T12:00:00`,
+      endTime: null,
+      notes: notesEl.value.trim() || null,
+      isManual: true,
+    });
+    hrsEl.value = ''; minsEl.value = ''; notesEl.value = '';
+    showToast('Time logged');
+    await loadMemberWorkspaceData();
+    renderMemberWorkspace();
+  } catch (e) { showToast('Could not save — check your connection'); }
+};
+
+window.editTimeLogNotes = async function editTimeLogNotes(id) {
+  const log = myTimeLogs.find((l) => l.id === id); if (!log) return;
+  const next = window.prompt('Edit notes for this time entry:', log.notes || '');
+  if (next === null) return;
+  try {
+    await updateTimeLog(id, { notes: next.trim() || null });
+    log.notes = next.trim();
+    renderMemberLogsList();
+    showToast('Notes updated');
+  } catch (e) { showToast('Could not update this entry'); }
+};
+
+function populateMemberProjectSelects() {
+  const options = memberProjects.length
+    ? memberProjects.map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join('')
+    : '<option value="">No projects assigned</option>';
+  ['timerProjectSelect', 'manualProjectSelect'].forEach((id) => {
+    const sel = document.getElementById(id);
+    if (!sel) return;
+    const prev = sel.value;
+    sel.innerHTML = options;
+    if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+  });
+  const dateEl = document.getElementById('manualDate');
+  if (dateEl && !dateEl.value) dateEl.value = new Date().toISOString().slice(0, 10);
+}
+
+function renderMemberStats() {
+  const el = document.getElementById('memberStatStrip');
+  if (!el) return;
+  const now = new Date();
+  const day = now.getDay();
+  const mon = new Date(now); mon.setDate(now.getDate() + (day === 0 ? -6 : 1 - day)); mon.setHours(0, 0, 0, 0);
+  const weekSeconds = myTimeLogs.filter((l) => new Date(l.startTime) >= mon).reduce((s, l) => s + l.duration, 0);
+  const totalSeconds = myTimeLogs.reduce((s, l) => s + l.duration, 0);
+  el.innerHTML = `
+    <div class="stat"><div class="label">This week</div><div class="value teal">${formatDuration(weekSeconds)}</div></div>
+    <div class="stat"><div class="label">All-time logged</div><div class="value accent">${formatDuration(totalSeconds)}</div></div>
+    <div class="stat"><div class="label">Assigned projects</div><div class="value">${memberProjects.length}</div></div>
+    <div class="stat"><div class="label">Total entries</div><div class="value">${myTimeLogs.length}</div></div>
+  `;
+}
+
+function renderMemberProjectsList() {
+  const el = document.getElementById('memberProjectsList');
+  if (!el) return;
+  if (!myMemberId) {
+    el.innerHTML = '<div class="empty">Your login isn\'t linked to a team member yet. Ask your admin to add your email in the Team tab.</div>';
+    return;
+  }
+  if (!memberProjects.length) { el.innerHTML = '<div class="empty">No projects assigned to you yet.</div>'; return; }
+  el.innerHTML = memberProjects.map((p) => {
+    const secs = myTimeLogs.filter((l) => l.projectId === p.id).reduce((s, l) => s + l.duration, 0);
+    return `
+    <div class="proj-item">
+      <div>
+        <div class="pname">${esc(p.name)}</div>
+        <div class="pmeta">Status: ${esc(p.status.replace('_', ' '))} · ${formatDuration(secs)} logged total</div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function renderMemberLogsList() {
+  const el = document.getElementById('memberLogsList');
+  if (!el) return;
+  if (!myTimeLogs.length) { el.innerHTML = '<div class="empty">No time logged yet — start the timer or log time manually above.</div>'; return; }
+  const nameFor = (id) => (memberProjects.find((p) => p.id === id)?.name) || 'Unknown project';
+  el.innerHTML = myTimeLogs.slice(0, 30).map((l) => `
+    <div class="log-item">
+      <div>
+        <div class="lname">${esc(nameFor(l.projectId))}</div>
+        <div class="lmeta">${formatLogDate(l.startTime)}${l.notes ? ' · ' + esc(l.notes) : ''}<span class="log-tag">${l.isManual ? 'manual' : 'timer'}</span><span class="log-edit" onclick="editTimeLogNotes('${l.id}')">Edit notes</span></div>
+      </div>
+      <div class="lhrs">${formatDuration(l.duration)}</div>
+    </div>`).join('');
+}
+
+function renderMemberWorkspace() {
+  populateMemberProjectSelects();
+  renderMemberStats();
+  renderMemberProjectsList();
+  renderMemberLogsList();
+}
+
+async function loadMemberWorkspaceData() {
+  const session = getSession();
+  myMemberId = session ? await getMemberIdForAuthUser(session.user.id) : null;
+  try { memberProjects = await fetchProjects(); } catch (e) { memberProjects = []; }
+  try {
+    myTimeLogs = session ? await fetchTimeLogs({ userId: session.user.id }) : [];
+  } catch (e) { myTimeLogs = []; }
+}
+
+/* ================= Security modal: two-factor authentication (Phase 4, NEW) =================
+   Account-level, not workspace-specific — available to admins and members
+   alike via the "Security" button in the header. Password reset itself
+   lives on the login screen (Forgot Password); this modal only covers 2FA. */
+
+let pendingEnrollFactorId = null;
+
+window.openSecurityModal = async function openSecurityModal() {
+  document.getElementById('securityModalBg').classList.add('show');
+  document.getElementById('securityError').textContent = '';
+  await refreshSecurityStatus();
+};
+
+window.closeSecurityModal = function closeSecurityModal() {
+  document.getElementById('securityModalBg').classList.remove('show');
+  if (pendingEnrollFactorId) { mfaUnenroll(pendingEnrollFactorId).catch(() => {}); pendingEnrollFactorId = null; }
+  document.getElementById('mfaEnrollCode').value = '';
+};
+
+async function refreshSecurityStatus() {
+  const statusLine = document.getElementById('securityStatusLine');
+  const disabledEl = document.getElementById('security2faDisabled');
+  const enrollingEl = document.getElementById('security2faEnrolling');
+  const enabledEl = document.getElementById('security2faEnabled');
+  disabledEl.style.display = 'none'; enrollingEl.style.display = 'none'; enabledEl.style.display = 'none';
+  try {
+    const factors = await mfaListFactors();
+    const verified = (factors.totp || []).find((f) => f.status === 'verified');
+    if (verified) {
+      statusLine.textContent = 'Status: enabled';
+      enabledEl.dataset.factorId = verified.id;
+      enabledEl.style.display = '';
+    } else {
+      statusLine.textContent = 'Status: not enabled';
+      disabledEl.style.display = '';
+    }
+  } catch (e) { statusLine.textContent = 'Could not load 2FA status.'; }
+}
+
+window.startMfaEnrollment = async function startMfaEnrollment() {
+  document.getElementById('securityError').textContent = '';
+  try {
+    const enrolled = await mfaEnrollTotp();
+    pendingEnrollFactorId = enrolled.id;
+    document.getElementById('mfaQrImage').src = enrolled.totp.qr_code;
+    document.getElementById('mfaSecretText').textContent = enrolled.totp.secret;
+    document.getElementById('security2faDisabled').style.display = 'none';
+    document.getElementById('security2faEnrolling').style.display = '';
+  } catch (e) { document.getElementById('securityError').textContent = 'Could not start 2FA enrollment.'; }
+};
+
+window.cancelMfaEnrollment = async function cancelMfaEnrollment() {
+  if (pendingEnrollFactorId) { try { await mfaUnenroll(pendingEnrollFactorId); } catch (e) { /* best-effort cleanup */ } pendingEnrollFactorId = null; }
+  document.getElementById('mfaEnrollCode').value = '';
+  document.getElementById('securityError').textContent = '';
+  await refreshSecurityStatus();
+};
+
+window.confirmMfaEnrollment = async function confirmMfaEnrollment() {
+  const errorEl = document.getElementById('securityError');
+  const code = (document.getElementById('mfaEnrollCode').value || '').trim();
+  if (!/^\d{6}$/.test(code)) { errorEl.textContent = 'Enter the 6-digit code from your app.'; return; }
+  try {
+    await mfaVerifyCode(pendingEnrollFactorId, code);
+    pendingEnrollFactorId = null;
+    document.getElementById('mfaEnrollCode').value = '';
+    errorEl.textContent = '';
+    showToast('Two-factor authentication enabled');
+    await refreshSecurityStatus();
+  } catch (e) { errorEl.textContent = 'Incorrect code. Try again.'; }
+};
+
+window.disableMfa = async function disableMfa() {
+  const enabledEl = document.getElementById('security2faEnabled');
+  const factorId = enabledEl.dataset.factorId;
+  if (!factorId) return;
+  if (!confirm('Disable two-factor authentication on your account?')) return;
+  try {
+    await mfaUnenroll(factorId);
+    showToast('Two-factor authentication disabled');
+    await refreshSecurityStatus();
+  } catch (e) { document.getElementById('securityError').textContent = 'Could not disable 2FA.'; }
+};
+
 /* ================= Init (after auth) ================= */
 let initialized = false;
-async function initApp() {
-  if (unsubscribeRealtime) unsubscribeRealtime();
+
+async function initAdminWorkspace() {
   buildWeeks();
   await loadData();
   const cur = currentWeekLabel();
@@ -766,6 +1604,21 @@ async function initApp() {
   setupLogo();
   buildPeriodOptions();
   render();
+}
+
+async function initMemberWorkspace() {
+  // Branding only — never touches the admin-scoped `members`/`assignments` tables.
+  try { data = { ...data, ...(await fetchAppSettingsOnly()) }; } catch (e) { /* keep defaults */ }
+  applyAppName();
+  applyLogo();
+  await loadMemberWorkspaceData();
+  renderMemberWorkspace();
+}
+
+async function initApp() {
+  if (unsubscribeRealtime) unsubscribeRealtime();
+  if (isAdmin()) await initAdminWorkspace();
+  else await initMemberWorkspace();
   unsubscribeRealtime = subscribeToBoard(reload);
   initialized = true;
 }
@@ -774,6 +1627,7 @@ initAuth({
   onAuthed: () => { initApp(); },
   onSignedOut: () => {
     if (unsubscribeRealtime) { unsubscribeRealtime(); unsubscribeRealtime = null; }
+    if (timerState.intervalId) { clearInterval(timerState.intervalId); timerState.intervalId = null; }
     initialized = false;
   },
 });
